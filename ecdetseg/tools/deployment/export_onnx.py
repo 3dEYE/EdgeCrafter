@@ -56,17 +56,20 @@ def main(args, ):
     model = Model()
 
     img_size = cfg.yaml_cfg["eval_spatial_size"]
-    data = torch.rand(1, 3, *img_size)
-    size = torch.tensor([img_size])
+    data = torch.rand(args.batch_size, 3, *img_size)
+    size = torch.tensor([img_size] * args.batch_size)
     _ = model(data, size)
-
-    dynamic_axes = {
-        'images': {0: 'N', },
-        'orig_target_sizes': {0: 'N'}
-    }
 
     output_file = args.resume.replace('.pth', '.onnx') if args.resume else 'model.onnx'
     output_names = ['labels', 'boxes', 'scores'] + (['masks'] if task == 'segmentation' else [])
+
+    dynamic_axes = None
+    if not args.static_batch:
+        dynamic_axes = {
+            'images': {0: 'N'},
+            'orig_target_sizes': {0: 'N'},
+        }
+        dynamic_axes.update({name: {0: 'N'} for name in output_names})
     
     torch.onnx.export(
         model,
@@ -78,6 +81,8 @@ def main(args, ):
         opset_version=args.opset,
         verbose=False,
         do_constant_folding=True,
+        external_data=args.external_data,
+        dynamo=False,
     )
 
     if args.check:
@@ -93,7 +98,7 @@ def main(args, ):
         # input_shapes = {'images': [1, 3, 640, 640], 'orig_target_sizes': [1, 2]} if dynamic else None
         input_shapes = {'images': data.shape, 'orig_target_sizes': size.shape} if dynamic else None
         onnx_model_simplify, check = onnxsim.simplify(output_file, test_input_shapes=input_shapes)
-        onnx.save(onnx_model_simplify, output_file)
+        onnx.save(onnx_model_simplify, output_file, save_as_external_data=args.external_data)
         print(f'Simplify onnx model {check}...')
 
 
@@ -103,8 +108,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', default='configs/dfine/dfine_hgnetv2_l_coco.yml', type=str, )
     parser.add_argument('--resume', '-r', type=str, )
-    parser.add_argument('--opset', type=int, default=18,)
+    parser.add_argument('--opset', type=int, default=20,)
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Example batch size used during export tracing.')
+    parser.add_argument('--static-batch', action='store_true',
+                        help='Export a fixed batch dimension instead of dynamic N.')
     parser.add_argument('--check',  action='store_true')
     parser.add_argument('--simplify',  action='store_true')
+    parser.add_argument('--external-data', action='store_true',
+                        help='Save ONNX weights to an external .data file. Disabled by default.')
     args = parser.parse_args()
     main(args)

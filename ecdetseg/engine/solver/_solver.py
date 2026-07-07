@@ -229,11 +229,12 @@ class BaseSolver(object):
                 cur_tensor = cur_state_dict[param_name]
                 pretrain_tensor = pretrain_state_dict[param_name]
                 adjusted_tensor = self.map_class_weights(cur_tensor, pretrain_tensor)
-                if adjusted_tensor is not None:
+                if adjusted_tensor is not None and adjusted_tensor.size() == cur_tensor.size():
                     pretrain_state_dict[param_name] = adjusted_tensor
                     adjusted_params.append(param_name)
                 else:
-                    print(f"Cannot adjust parameter '{param_name}' due to size mismatch.")
+                    del pretrain_state_dict[param_name]
+                    print(f"Skip parameter '{param_name}' due to class-head size mismatch.")
 
         return pretrain_state_dict
 
@@ -242,15 +243,20 @@ class BaseSolver(object):
         if pretrain_tensor.size() == cur_tensor.size():
             return pretrain_tensor
 
+        if pretrain_tensor.ndim == 0 or cur_tensor.ndim == 0:
+            return None
+
         adjusted_tensor = cur_tensor.clone()
         adjusted_tensor.requires_grad = False
 
-        if pretrain_tensor.size() > cur_tensor.size():
+        if pretrain_tensor.shape[0] == max(self.obj365_ids) + 2 and cur_tensor.shape[0] == len(self.obj365_ids):
             for coco_id, obj_id in enumerate(self.obj365_ids):
                 adjusted_tensor[coco_id] = pretrain_tensor[obj_id+1]
-        else:
+        elif pretrain_tensor.shape[0] == len(self.obj365_ids) and cur_tensor.shape[0] == max(self.obj365_ids) + 2:
             for coco_id, obj_id in enumerate(self.obj365_ids):
                 adjusted_tensor[obj_id+1] = pretrain_tensor[coco_id]
+        else:
+            return None
 
         return adjusted_tensor
 

@@ -8,10 +8,12 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 
 import copy
 import re
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import yaml
 from torch.utils.data import DataLoader
 
 from ._config import BaseConfig
@@ -25,6 +27,7 @@ class YAMLConfig(BaseConfig):
 
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
+        self.resolve_yolo_num_classes(cfg)
 
         self.yaml_cfg = copy.deepcopy(cfg)
         self.reset_cfg()
@@ -176,19 +179,60 @@ class YAMLConfig(BaseConfig):
         loader.shuffle = self.yaml_cfg[name].get('shuffle', False)
         return loader
 
+    @staticmethod
+    def resolve_yolo_num_classes(cfg: dict):
+        if cfg.get('num_classes', None) is not None:
+            return
+
+        data_file = cfg.get('yolo_data_file', None)
+        if data_file is None and cfg.get('yolo_root', None) is not None:
+            yolo_root = Path(cfg['yolo_root']).expanduser()
+            for name in ('data.yaml', 'data.yml', 'data_win.yaml', 'dataset.yaml', 'dataset.yml'):
+                candidate = yolo_root / name
+                if candidate.exists():
+                    data_file = candidate
+                    cfg['yolo_data_file'] = str(candidate)
+                    break
+
+        if data_file is None:
+            for loader_name in ('train_dataloader', 'val_dataloader'):
+                dataset_cfg = cfg.get(loader_name, {}).get('dataset', {})
+                if dataset_cfg.get('type') == 'YOLODetection':
+                    data_file = dataset_cfg.get('data_file', None)
+                    if data_file is not None:
+                        break
+
+        if data_file is None:
+            return
+
+        data_path = Path(data_file).expanduser()
+        with data_path.open('r', encoding='utf-8') as f:
+            data_cfg = yaml.safe_load(f) or {}
+
+        num_classes = data_cfg.get('nc', None)
+        if num_classes is None:
+            names = data_cfg.get('names', None)
+            if isinstance(names, (list, tuple, dict)):
+                num_classes = len(names)
+
+        if num_classes is None:
+            raise ValueError(f"Can not infer num_classes from YOLO data file: {data_file}")
+
+        cfg['num_classes'] = int(num_classes)
+
     def reset_cfg(self):
         """reset tranforms size according to input size, and check stop_epoch for training transforms.
         """
         input_size = self.yaml_cfg['eval_spatial_size'][0]
-        
+
         def simple_glom(data, path):
             for key in path.split("."):
                 data = data[key]
             return data
-        
+
         train_ops = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.ops')
         val_ops = simple_glom(self.yaml_cfg, 'val_dataloader.dataset.transforms.ops')
-        
+
         for ops in [train_ops, val_ops]:
             for op in ops:
                 t = op.get("type")
@@ -196,16 +240,15 @@ class YAMLConfig(BaseConfig):
                     op["output_size"] = input_size // 2
                 elif t == "Resize":
                     op["size"] = (input_size, input_size)
-        
+
         stop_aug_epoch = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.stop_epoch')
         epochs = self.yaml_cfg['epochs']
         no_aug_epoch = epochs - stop_aug_epoch
         if not 0 <= no_aug_epoch <= 5:
             self.yaml_cfg['train_dataloader']['dataset']['transforms']['stop_epoch'] = epochs - 2
-            
+
             import warnings
             warnings.warn(
                 "'stop_epoch' was not correctly set for training transforms. "
                 "Automatically adjusted to: epochs - 2.",
                 UserWarning)
-        

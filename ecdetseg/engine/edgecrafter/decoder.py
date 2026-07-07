@@ -653,8 +653,10 @@ class ECTransformer(nn.Module):
         else:
             anchors = self.anchors
             valid_mask = self.valid_mask
-        if memory.shape[0] > 1:
-            anchors = anchors.repeat(memory.shape[0], 1, 1)
+
+        batch_size = memory.size(0)
+        anchors = anchors.expand(batch_size, -1, -1)
+        valid_mask = valid_mask.expand(batch_size, -1, -1)
 
         # memory = torch.where(valid_mask, memory, 0)
         memory = valid_mask.to(memory.dtype) * memory

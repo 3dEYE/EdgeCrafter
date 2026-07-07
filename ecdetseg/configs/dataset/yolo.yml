@@ -1,0 +1,37 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', ]
+  verbose: False
+
+num_classes: ~
+remap_mscoco_category: False
+
+yolo_root: ~
+yolo_data_file: ~
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: YOLODetection
+    split: train
+    return_masks: False
+  shuffle: True
+  num_workers: 4
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: YOLODetection
+    split: val
+    return_masks: False
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

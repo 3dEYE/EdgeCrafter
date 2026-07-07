@@ -1,0 +1,6 @@
+__include__: [
+  'ecdet_x.yml',
+  '../dataset/yolo.yml',
+]
+
+output_dir: outputs/ecdet_x_yolo

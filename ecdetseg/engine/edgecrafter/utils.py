@@ -103,6 +103,14 @@ def deformable_attention_core_func_v2(\
 
     # sampling_offsets [8, 480, 8, 12, 2]
     if method == 'default':
+        if torch.onnx.is_in_onnx_export():
+            return _deformable_attention_core_func_v2_onnx(
+                value,
+                value_spatial_shapes,
+                sampling_locations,
+                attention_weights,
+                num_points_list,
+            )
         sampling_grids = 2 * sampling_locations - 1
 
     elif method == 'discrete':
@@ -142,6 +150,68 @@ def deformable_attention_core_func_v2(\
     attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, Len_q, sum(num_points_list))
     weighted_sample_locs = torch.concat(sampling_value_list, dim=-1) * attn_weights
     output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, Len_q)
+
+    return output.permute(0, 2, 1)
+
+
+def _bilinear_sample_2d(value: torch.Tensor, coords: torch.Tensor, h: int, w: int):
+    bs, n_head, c, _ = value.shape
+    batch_heads = bs * n_head
+    len_q = coords.shape[1]
+    num_points = coords.shape[2]
+
+    flat_value = value.reshape(batch_heads, c, h * w).permute(0, 2, 1)
+    x = coords[..., 0] * w - 0.5
+    y = coords[..., 1] * h - 0.5
+    x0 = torch.floor(x)
+    y0 = torch.floor(y)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    def gather(ixf, iyf):
+        valid = (ixf >= 0) & (ixf <= w - 1) & (iyf >= 0) & (iyf <= h - 1)
+        ix = ixf.clamp(0, w - 1).to(torch.int64)
+        iy = iyf.clamp(0, h - 1).to(torch.int64)
+        linear_idx = (iy * w + ix).reshape(batch_heads, len_q * num_points)
+        gathered = torch.gather(
+            flat_value,
+            1,
+            linear_idx.unsqueeze(-1).expand(-1, -1, c),
+        ).reshape(batch_heads, len_q, num_points, c)
+        return gathered * valid.unsqueeze(-1).to(gathered.dtype)
+
+    v00 = gather(x0, y0)
+    v01 = gather(x0, y1)
+    v10 = gather(x1, y0)
+    v11 = gather(x1, y1)
+
+    wx0 = (x1 - x).unsqueeze(-1)
+    wx1 = (x - x0).unsqueeze(-1)
+    wy0 = (y1 - y).unsqueeze(-1)
+    wy1 = (y - y0).unsqueeze(-1)
+    sampled = v00 * wx0 * wy0 + v01 * wx0 * wy1 + v10 * wx1 * wy0 + v11 * wx1 * wy1
+    return sampled.permute(0, 3, 1, 2)
+
+
+def _deformable_attention_core_func_v2_onnx(
+    value: torch.Tensor,
+    value_spatial_shapes,
+    sampling_locations: torch.Tensor,
+    attention_weights: torch.Tensor,
+    num_points_list: List[int],
+):
+    bs, n_head, c, _ = value[0].shape
+    len_q = sampling_locations.shape[1]
+    sampling_locations = sampling_locations.permute(0, 2, 1, 3, 4).flatten(0, 1)
+    sampling_locations_list = sampling_locations.split(num_points_list, dim=-2)
+
+    sampling_value_list = []
+    for level, (h, w) in enumerate(value_spatial_shapes):
+        sampling_value_list.append(_bilinear_sample_2d(value[level], sampling_locations_list[level], h, w))
+
+    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, len_q, sum(num_points_list))
+    weighted_sample_locs = torch.concat(sampling_value_list, dim=-1) * attn_weights
+    output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, len_q)
 
     return output.permute(0, 2, 1)
 

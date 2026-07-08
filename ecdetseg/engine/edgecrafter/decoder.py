@@ -701,16 +701,19 @@ class ECTransformer(nn.Module):
 
         topk_ind: torch.Tensor
 
-        topk_anchors = outputs_anchors_unact.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_anchors_unact.shape[-1]))
-
-        topk_logits = outputs_logits.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_logits.shape[-1])) if self.training else None
-
-        topk_memory = memory.gather(dim=1, \
-            index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
+        topk_anchors = self._batch_index_select(outputs_anchors_unact, topk_ind)
+        topk_logits = self._batch_index_select(outputs_logits, topk_ind) if self.training else None
+        topk_memory = self._batch_index_select(memory, topk_ind)
 
         return topk_memory, topk_logits, topk_anchors
+
+    @staticmethod
+    def _batch_index_select(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        batch_size, length = x.shape[:2]
+        flat_index = index + torch.arange(batch_size, device=index.device).unsqueeze(1) * length
+        flat_x = x.reshape(batch_size * length, *x.shape[2:])
+        selected = flat_x.index_select(0, flat_index.reshape(-1))
+        return selected.reshape(batch_size, index.shape[1], *x.shape[2:])
     
     @staticmethod
     def _split(x, dim, s_idx):

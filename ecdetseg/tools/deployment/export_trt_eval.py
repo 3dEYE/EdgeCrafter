@@ -204,7 +204,8 @@ def _precision_supported(builder, trt, precision: str) -> bool:
     if precision == "fp8":
         if not hasattr(trt.BuilderFlag, "FP8"):
             return False
-        return bool(getattr(builder, "platform_has_fast_fp8", True))
+        fast_fp8 = getattr(builder, "platform_has_fast_fp8", None)
+        return True if fast_fp8 is None else bool(fast_fp8)
     raise ValueError(f"Unsupported precision: {precision}")
 
 
@@ -218,6 +219,7 @@ def _set_profile(
     image_hw: Tuple[int, int],
 ) -> None:
     profile = builder.create_optimization_profile()
+    has_dynamic_input = False
     img_h, img_w = image_hw
 
     for i in range(network.num_inputs):
@@ -225,6 +227,7 @@ def _set_profile(
         shape = tuple(inp.shape)
         if all(dim > 0 for dim in shape):
             continue
+        has_dynamic_input = True
 
         if inp.name == "images":
             min_shape = (min_batch, 3, img_h, img_w)
@@ -239,7 +242,8 @@ def _set_profile(
 
         profile.set_shape(inp.name, min=min_shape, opt=opt_shape, max=max_shape)
 
-    config.add_optimization_profile(profile)
+    if has_dynamic_input:
+        config.add_optimization_profile(profile)
 
 
 def build_engine(
@@ -357,9 +361,26 @@ class TRTInference:
         else:
             self.input_names = [name for name in self.io_names if self.engine.binding_is_input(name)]
             self.output_names = [name for name in self.io_names if not self.engine.binding_is_input(name)]
+        self.fixed_batch_size = self._get_fixed_batch_size()
 
     def _binding_index(self, name: str) -> int:
         return self.io_names.index(name)
+
+    def _get_engine_shape(self, name: str) -> Tuple[int, ...]:
+        if hasattr(self.engine, "get_tensor_shape"):
+            return tuple(int(dim) for dim in self.engine.get_tensor_shape(name))
+        return tuple(int(dim) for dim in self.engine.get_binding_shape(self._binding_index(name)))
+
+    def _is_dynamic_input(self, name: str) -> bool:
+        return any(dim < 0 for dim in self._get_engine_shape(name))
+
+    def _get_fixed_batch_size(self) -> Optional[int]:
+        if "images" not in self.input_names:
+            return None
+        shape = self._get_engine_shape("images")
+        if shape and shape[0] > 0:
+            return shape[0]
+        return None
 
     def _set_input_shape(self, name: str, shape: Tuple[int, ...]) -> None:
         if hasattr(self.context, "set_input_shape"):
@@ -384,7 +405,13 @@ class TRTInference:
         for name in self.input_names:
             if name not in inputs:
                 raise KeyError(f"Missing TensorRT input: {name}")
-            self._set_input_shape(name, tuple(inputs[name].shape))
+            input_shape = tuple(inputs[name].shape)
+            if self._is_dynamic_input(name):
+                self._set_input_shape(name, input_shape)
+            else:
+                engine_shape = self._get_engine_shape(name)
+                if input_shape != engine_shape:
+                    raise ValueError(f"Static TensorRT input shape mismatch for {name}: got {input_shape}, expected {engine_shape}")
 
         outputs: Dict[str, torch.Tensor] = OrderedDict()
         for name in self.output_names:
@@ -411,6 +438,42 @@ class TRTInference:
         if not ok:
             raise RuntimeError("TensorRT execution failed.")
         return outputs
+
+
+def _pad_static_batch(
+    samples: torch.Tensor,
+    orig_target_sizes: torch.Tensor,
+    fixed_batch_size: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    actual_batch_size = samples.shape[0]
+    if fixed_batch_size is None or actual_batch_size == fixed_batch_size:
+        return samples, orig_target_sizes, actual_batch_size
+    if actual_batch_size > fixed_batch_size:
+        raise ValueError(
+            f"Batch size {actual_batch_size} is larger than static TensorRT batch size {fixed_batch_size}."
+        )
+
+    pad = fixed_batch_size - actual_batch_size
+    samples = torch.cat([samples, samples[:1].expand(pad, -1, -1, -1)], dim=0)
+    orig_target_sizes = torch.cat([orig_target_sizes, orig_target_sizes[:1].expand(pad, -1)], dim=0)
+    return samples.contiguous(), orig_target_sizes.contiguous(), actual_batch_size
+
+
+def _apply_eval_limit(dataset, eval_limit: Optional[int]) -> None:
+    if eval_limit is None:
+        return
+    if eval_limit <= 0:
+        raise ValueError(f"--eval-limit must be positive, got {eval_limit}.")
+    if eval_limit >= len(dataset):
+        print(f"Eval limit {eval_limit} >= dataset size {len(dataset)}; using full validation set.")
+        return
+
+    if hasattr(dataset, "image_files"):
+        dataset.image_files = dataset.image_files[:eval_limit]
+        print(f"Eval limited to first {eval_limit} images.")
+        return
+
+    raise TypeError(f"--eval-limit is not implemented for dataset type {type(dataset).__name__}.")
 
 
 def _build_eval_cfg(args) -> YAMLConfig:
@@ -440,11 +503,20 @@ def _build_eval_cfg(args) -> YAMLConfig:
 
 
 @torch.no_grad()
-def evaluate_engine(engine_path: Path, cfg: YAMLConfig, score_threshold: float, verbose: bool) -> List[float]:
+def evaluate_engine(
+    engine_path: Path,
+    cfg: YAMLConfig,
+    score_threshold: float,
+    verbose: bool,
+    eval_limit: Optional[int],
+) -> List[float]:
     device = "cuda"
     runner = TRTInference(engine_path, device=device, verbose=verbose)
+    if runner.fixed_batch_size is not None:
+        print(f"TensorRT engine uses static batch size {runner.fixed_batch_size}; final partial batch will be padded and trimmed.")
 
     val_loader = cfg.val_dataloader
+    _apply_eval_limit(val_loader.dataset, eval_limit)
     coco_gt = get_coco_api_from_dataset(val_loader.dataset)
     iou_types = cfg.yaml_cfg["evaluator"].get("iou_types", ["bbox"])
     coco_evaluator = CocoEvaluator(coco_gt, iou_types, verbose=cfg.yaml_cfg["evaluator"].get("verbose", True))
@@ -454,11 +526,16 @@ def evaluate_engine(engine_path: Path, cfg: YAMLConfig, score_threshold: float, 
     for samples, targets in metric_logger.log_every(val_loader, 10, f"TensorRT eval {engine_path.name}:"):
         samples = samples.to(device, non_blocking=True)
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device)
+        samples, orig_target_sizes, actual_batch_size = _pad_static_batch(
+            samples,
+            orig_target_sizes,
+            runner.fixed_batch_size,
+        )
         outputs = runner({"images": samples, "orig_target_sizes": orig_target_sizes})
 
-        labels = outputs["labels"].long()
-        boxes = outputs["boxes"].float()
-        scores = outputs["scores"].float()
+        labels = outputs["labels"][:actual_batch_size].long()
+        boxes = outputs["boxes"][:actual_batch_size].float()
+        scores = outputs["scores"][:actual_batch_size].float()
 
         results = []
         for label, box, score in zip(labels, boxes, scores):
@@ -573,7 +650,7 @@ def main(args) -> None:
 
     eval_cfg = _build_eval_cfg(args)
     for engine_path in built_engines:
-        evaluate_engine(engine_path, eval_cfg, args.score_threshold, args.verbose)
+        evaluate_engine(engine_path, eval_cfg, args.score_threshold, args.verbose, args.eval_limit)
 
 
 def parse_args():
@@ -614,6 +691,7 @@ def parse_args():
     parser.add_argument("--opt-batch", type=int, default=1)
     parser.add_argument("--max-batch", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=None)
+    parser.add_argument("--eval-limit", type=int, default=None, help="Evaluate only the first N validation images.")
     parser.add_argument("--gpu", type=int, default=None, help="Visible CUDA device index, e.g. --gpu 1.")
     parser.add_argument("--num-top-queries", type=int, default=None, help="Override PostProcessor.num_top_queries.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Filter predictions before COCO eval.")

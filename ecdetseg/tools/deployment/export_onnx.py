@@ -182,7 +182,8 @@ if __name__ == '__main__':
     parser.add_argument('--static-batch', action='store_true',
                         help='Export a fixed batch dimension instead of dynamic N.')
     parser.add_argument('--check',  action='store_true')
-    parser.add_argument('--simplify',  action='store_true')
+    parser.add_argument('--simplify', action='store_true', default=False,
+                        help='Run onnxsim after export. Disabled by default; use only for debugging.')
     parser.add_argument('--external-data', action='store_true',
                         help='Save ONNX weights to an external .data file. Disabled by default.')
     args = parser.parse_args()

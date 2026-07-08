@@ -883,7 +883,12 @@ def parse_args():
     parser.add_argument("--skip-build", action="store_true", help="Use existing engine files if present.")
     parser.add_argument("--no-eval", action="store_true", help="Only export/build, do not evaluate mAP.")
     parser.add_argument("--check", action="store_true", help="Run ONNX checker after export.")
-    parser.add_argument("--simplify", action="store_true", help="Run onnxsim after export.")
+    parser.add_argument(
+        "--simplify",
+        action="store_true",
+        default=False,
+        help="Run onnxsim after export. Disabled by default; not recommended for TensorRT production builds.",
+    )
     parser.add_argument("--strict-load", action="store_true", help="Require checkpoint tensors to match exactly.")
     parser.add_argument("--strict-fp8", action="store_true", help="Fail if FP8 build is requested but fails.")
     parser.add_argument("--dump-inspector", action="store_true", help="Dump TensorRT EngineInspector JSON for each engine.")

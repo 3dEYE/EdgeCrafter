@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 from ..core import register
 from .denoising import get_contrastive_denoising_training_group
@@ -300,6 +301,7 @@ class TransformerDecoder(nn.Module):
         self.num_head = num_head
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.up, self.reg_scale, self.reg_max = up, reg_scale, reg_max
+        self.deploy_mode = False
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(self.eval_idx + 1)] \
                     + [copy.deepcopy(decoder_layer_wide) for _ in range(num_layers - self.eval_idx - 1)])
         self.segmentation_head = segmentation_head
@@ -318,9 +320,63 @@ class TransformerDecoder(nn.Module):
         return value.permute(0, 2, 3, 1).split(split_shape, dim=-1)
 
     def convert_to_deploy(self):
+        self.deploy_mode = True
         self.project = weighting_function(self.reg_max, self.up, self.reg_scale, deploy=True)
         self.layers = self.layers[:self.eval_idx + 1]
         self.lqe_layers = nn.ModuleList([nn.Identity()] * (self.eval_idx) + [self.lqe_layers[self.eval_idx]])
+
+    def forward_deploy(self,
+                target,
+                ref_points_unact,
+                memory,
+                spatial_shapes,
+                bbox_head,
+                score_head,
+                query_pos_head,
+                pre_bbox_head,
+                integral,
+                up,
+                reg_scale,
+                memory_mask=None):
+        output = target
+        output_detach = pred_corners_undetach = 0
+        value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
+
+        if not hasattr(self, 'project'):
+            project = weighting_function(self.reg_max, up, reg_scale)
+        else:
+            project = self.project
+
+        ref_points_detach = F.sigmoid(ref_points_unact)
+        query_pos_embed = query_pos_head(ref_points_detach).clamp(min=-10, max=10)
+
+        for i, layer in enumerate(self.layers):
+            ref_points_input = ref_points_detach.unsqueeze(2)
+
+            if i >= self.eval_idx + 1 and self.layer_scale > 1:
+                query_pos_embed = F.interpolate(query_pos_embed, scale_factor=self.layer_scale)
+                value = self.value_op(memory, None, query_pos_embed.shape[-1], memory_mask, spatial_shapes)
+                output = F.interpolate(output, size=query_pos_embed.shape[-1])
+                output_detach = output.detach()
+
+            output = layer(output, ref_points_input, value, spatial_shapes, None, query_pos_embed)
+
+            if i == 0:
+                ref_points_initial = F.sigmoid(pre_bbox_head(output) + inverse_sigmoid(ref_points_detach)).detach()
+
+            pred_corners = bbox_head[i](output + output_detach) + pred_corners_undetach
+            inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
+
+            if i == self.eval_idx:
+                scores = score_head[i](output)
+                scores = self.lqe_layers[i](scores, pred_corners)
+                return inter_ref_bbox, scores
+
+            pred_corners_undetach = pred_corners
+            ref_points_detach = inter_ref_bbox.detach()
+            output_detach = output.detach()
+
+        raise RuntimeError("Decoder deploy path did not reach eval_idx.")
 
     def forward(self,
                 spatial_features,
@@ -460,6 +516,7 @@ class ECTransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.deploy_mode = False
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -532,10 +589,20 @@ class ECTransformer(nn.Module):
         self._reset_parameters(feat_channels)
 
     def convert_to_deploy(self):
+        self.deploy_mode = True
+        self._fuse_input_proj()
         self.dec_score_head = nn.ModuleList([nn.Identity()] * (self.eval_idx) + [self.dec_score_head[self.eval_idx]])
         self.dec_bbox_head = nn.ModuleList(
             [self.dec_bbox_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_bbox_head))]
         )
+
+    def _fuse_input_proj(self):
+        for i, proj in enumerate(self.input_proj):
+            if not isinstance(proj, nn.Sequential):
+                continue
+            if not hasattr(proj, 'conv') or not hasattr(proj, 'norm'):
+                continue
+            self.input_proj[i] = fuse_conv_bn_eval(proj.conv.eval(), proj.norm.eval())
 
     def _reset_parameters(self, feat_channels):
         bias = bias_init_with_prob(0.01)
@@ -739,6 +806,21 @@ class ECTransformer(nn.Module):
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+
+        if not self.training and self.deploy_mode and spatial_feat is None:
+            out_bboxes, out_logits = self.decoder.forward_deploy(
+                init_ref_contents,
+                init_ref_points_unact,
+                memory,
+                spatial_shapes,
+                self.dec_bbox_head,
+                self.dec_score_head,
+                self.query_pos_head,
+                self.pre_bbox_head,
+                self.integral,
+                self.up,
+                self.reg_scale)
+            return {'pred_logits': out_logits, 'pred_boxes': out_bboxes, 'pred_masks': None}
 
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, out_masks, pre_bboxes, pre_logits, pre_segs  = self.decoder(

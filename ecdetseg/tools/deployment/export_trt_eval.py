@@ -101,15 +101,67 @@ def _load_checkpoint_model(cfg: YAMLConfig, checkpoint_path: str, strict: bool =
         print(f"    ... {len(skipped) - 20} more skipped tensors")
 
 
+def _box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([
+        cx - 0.5 * w,
+        cy - 0.5 * h,
+        cx + 0.5 * w,
+        cy + 0.5 * h,
+    ], dim=-1)
+
+
+def _batch_index_select(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    batch_size, length = x.shape[:2]
+    flat_index = index + torch.arange(batch_size, device=index.device).unsqueeze(1) * length
+    flat_x = x.reshape(batch_size * length, *x.shape[2:])
+    selected = flat_x.index_select(0, flat_index.reshape(-1))
+    return selected.reshape(batch_size, index.shape[1], *x.shape[2:])
+
+
+def _topk_detections(
+    logits: torch.Tensor,
+    boxes: torch.Tensor,
+    num_classes: int,
+    num_top_queries: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scores = torch.sigmoid(logits)
+    scores, flat_index = torch.topk(scores.flatten(1), num_top_queries, dim=-1)
+    labels = (flat_index - flat_index // num_classes * num_classes).to(torch.int32)
+    box_index = flat_index // num_classes
+    boxes = _batch_index_select(_box_cxcywh_to_xyxy(boxes), box_index)
+    return labels, boxes, scores
+
+
 class DeployModel(nn.Module):
-    def __init__(self, cfg: YAMLConfig) -> None:
+    def __init__(self, cfg: YAMLConfig, export_mode: str) -> None:
         super().__init__()
         self.model = cfg.model.deploy()
-        self.postprocessor = cfg.postprocessor.deploy()
+        self.export_mode = export_mode
+        self.num_classes = int(cfg.yaml_cfg["num_classes"])
+        self.num_top_queries = int(cfg.postprocessor.num_top_queries)
+        if export_mode == "pixel":
+            self.postprocessor = cfg.postprocessor.deploy()
 
-    def forward(self, images: torch.Tensor, orig_target_sizes: torch.Tensor):
+    def forward(self, images: torch.Tensor, orig_target_sizes: Optional[torch.Tensor] = None):
         outputs = self.model(images)
-        return self.postprocessor(outputs, orig_target_sizes)
+        if self.export_mode == "raw":
+            return outputs["pred_logits"], outputs["pred_boxes"]
+
+        if self.export_mode == "normalized":
+            return _topk_detections(
+                outputs["pred_logits"],
+                outputs["pred_boxes"],
+                self.num_classes,
+                self.num_top_queries,
+            )
+
+        postprocessed = self.postprocessor(outputs, orig_target_sizes)
+        if len(postprocessed) == 4:
+            labels, boxes, scores, masks = postprocessed
+            return labels.to(torch.int32), boxes, scores, masks
+        labels, boxes, scores = postprocessed
+        return labels.to(torch.int32), boxes, scores
 
 
 def export_onnx(
@@ -122,34 +174,49 @@ def export_onnx(
     check: bool,
     simplify: bool,
     strict_load: bool,
+    export_mode: str,
 ) -> Path:
     if "ViTAdapter" in cfg.yaml_cfg:
         cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
     _load_checkpoint_model(cfg, checkpoint, strict=strict_load)
 
-    model = DeployModel(cfg).eval()
+    model = DeployModel(cfg, export_mode).eval()
     img_h, img_w = cfg.yaml_cfg["eval_spatial_size"]
     images = torch.rand(batch_size, 3, img_h, img_w)
-    orig_target_sizes = torch.tensor([[img_w, img_h]] * batch_size, dtype=torch.int64)
+    orig_target_sizes = torch.tensor([[img_w, img_h]] * batch_size, dtype=torch.float32)
     task = cfg.yaml_cfg["task"]
-    output_names = ["labels", "boxes", "scores"] + (["masks"] if task == "segmentation" else [])
+
+    if task == "segmentation" and export_mode != "pixel":
+        raise NotImplementedError(f"--export-mode {export_mode} is only implemented for detection.")
+
+    if export_mode == "raw":
+        input_args = (images,)
+        input_names = ["images"]
+        output_names = ["pred_logits", "pred_boxes"]
+    else:
+        output_names = ["labels", "boxes", "scores"] + (["masks"] if task == "segmentation" else [])
+        if export_mode == "pixel":
+            input_args = (images, orig_target_sizes)
+            input_names = ["images", "orig_target_sizes"]
+        else:
+            input_args = (images,)
+            input_names = ["images"]
 
     dynamic_axes = None
     if not static_batch:
-        dynamic_axes = {
-            "images": {0: "N"},
-            "orig_target_sizes": {0: "N"},
-        }
+        dynamic_axes = {"images": {0: "N"}}
+        if "orig_target_sizes" in input_names:
+            dynamic_axes["orig_target_sizes"] = {0: "N"}
         dynamic_axes.update({name: {0: "N"} for name in output_names})
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
-        _ = model(images, orig_target_sizes)
+        _ = model(*input_args)
         torch.onnx.export(
             model,
-            (images, orig_target_sizes),
+            input_args,
             str(output_file),
-            input_names=["images", "orig_target_sizes"],
+            input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=opset,
@@ -170,7 +237,9 @@ def export_onnx(
         import onnx
         import onnxsim
 
-        input_shapes = {"images": images.shape, "orig_target_sizes": orig_target_sizes.shape}
+        input_shapes = {"images": images.shape}
+        if "orig_target_sizes" in input_names:
+            input_shapes["orig_target_sizes"] = orig_target_sizes.shape
         onnx_model_simplify, ok = onnxsim.simplify(str(output_file), test_input_shapes=input_shapes)
         onnx.save(onnx_model_simplify, str(output_file), save_as_external_data=False)
         print(f"ONNX simplify: {ok}")
@@ -194,6 +263,19 @@ def _set_workspace(config, trt, workspace_gb: Optional[float]) -> None:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
     else:
         config.max_workspace_size = workspace_bytes
+
+
+def _set_profiling_verbosity(config, trt, verbosity: str) -> None:
+    if not hasattr(config, "profiling_verbosity") or not hasattr(trt, "ProfilingVerbosity"):
+        return
+    mapping = {
+        "none": getattr(trt.ProfilingVerbosity, "NONE", None),
+        "layer_names_only": getattr(trt.ProfilingVerbosity, "LAYER_NAMES_ONLY", None),
+        "detailed": getattr(trt.ProfilingVerbosity, "DETAILED", None),
+    }
+    value = mapping.get(verbosity)
+    if value is not None:
+        config.profiling_verbosity = value
 
 
 def _precision_supported(builder, trt, precision: str) -> bool:
@@ -256,6 +338,7 @@ def build_engine(
     image_hw: Tuple[int, int],
     workspace_gb: Optional[float],
     verbose: bool,
+    profiling_verbosity: str,
 ) -> Optional[Path]:
     import tensorrt as trt
 
@@ -269,6 +352,7 @@ def build_engine(
 
     config = builder.create_builder_config()
     _set_workspace(config, trt, workspace_gb)
+    _set_profiling_verbosity(config, trt, profiling_verbosity)
 
     explicit_batch = 0 if _trt_major(trt) >= 10 else (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     network = builder.create_network(explicit_batch)
@@ -312,6 +396,39 @@ def build_engine(
 
     print(f"Saved {precision.upper()} engine: {output_file}")
     return output_file
+
+
+def dump_engine_inspector(engine_path: Path, output_path: Optional[Path], verbose: bool) -> Path:
+    import tensorrt as trt
+
+    logger = _trt_logger(trt, verbose)
+    trt.init_libnvinfer_plugins(logger, "")
+    with engine_path.open("rb") as f, trt.Runtime(logger) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    if engine is None:
+        raise RuntimeError(f"Failed to deserialize TensorRT engine for inspector: {engine_path}")
+    if not hasattr(engine, "create_engine_inspector"):
+        raise RuntimeError("TensorRT engine inspector is not available in this TensorRT build.")
+
+    inspector = engine.create_engine_inspector()
+    fmt = getattr(getattr(trt, "LayerInformationFormat", object), "JSON", None)
+    if fmt is None:
+        fmt = getattr(getattr(trt, "LayerInformationFormat", object), "ONELINE", None)
+    if fmt is None:
+        info = inspector.get_engine_information()
+    else:
+        info = inspector.get_engine_information(fmt)
+
+    if output_path is None:
+        output_path = engine_path.with_name(f"{engine_path.name}.inspector.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(info, encoding="utf-8")
+
+    print(f"Saved TensorRT inspector dump: {output_path}")
+    print(f"  FP8 mentions: {info.count('FP8')}")
+    print(f"  FP16 mentions: {info.count('FP16')}")
+    print(f"  FP32 mentions: {info.count('FP32')}")
+    return output_path
 
 
 def _torch_dtype_from_trt(trt, dtype):
@@ -476,6 +593,41 @@ def _apply_eval_limit(dataset, eval_limit: Optional[int]) -> None:
     raise TypeError(f"--eval-limit is not implemented for dataset type {type(dataset).__name__}.")
 
 
+def _scale_normalized_boxes(boxes: torch.Tensor, orig_target_sizes: torch.Tensor) -> torch.Tensor:
+    return boxes * orig_target_sizes.repeat(1, 2).unsqueeze(1)
+
+
+def _parse_engine_outputs(
+    outputs: Dict[str, torch.Tensor],
+    orig_target_sizes: torch.Tensor,
+    actual_batch_size: int,
+    cfg: YAMLConfig,
+    export_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    orig_target_sizes = orig_target_sizes[:actual_batch_size].float()
+
+    if export_mode == "raw":
+        pred_logits = outputs["pred_logits"][:actual_batch_size].float()
+        pred_boxes = outputs["pred_boxes"][:actual_batch_size].float()
+        labels, boxes, scores = _topk_detections(
+            pred_logits,
+            pred_boxes,
+            int(cfg.yaml_cfg["num_classes"]),
+            int(cfg.postprocessor.num_top_queries),
+        )
+        boxes = _scale_normalized_boxes(boxes, orig_target_sizes)
+        return labels.long(), boxes.float(), scores.float()
+
+    labels = outputs["labels"][:actual_batch_size].long()
+    boxes = outputs["boxes"][:actual_batch_size].float()
+    scores = outputs["scores"][:actual_batch_size].float()
+
+    if export_mode == "normalized":
+        boxes = _scale_normalized_boxes(boxes, orig_target_sizes)
+
+    return labels, boxes, scores
+
+
 def _build_eval_cfg(args) -> YAMLConfig:
     update = parse_cli(args.update)
     if args.data is not None:
@@ -509,6 +661,7 @@ def evaluate_engine(
     score_threshold: float,
     verbose: bool,
     eval_limit: Optional[int],
+    export_mode: str,
 ) -> List[float]:
     device = "cuda"
     runner = TRTInference(engine_path, device=device, verbose=verbose)
@@ -525,17 +678,24 @@ def evaluate_engine(
     metric_logger = MetricLogger(delimiter="  ")
     for samples, targets in metric_logger.log_every(val_loader, 10, f"TensorRT eval {engine_path.name}:"):
         samples = samples.to(device, non_blocking=True)
-        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device)
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device).float()
         samples, orig_target_sizes, actual_batch_size = _pad_static_batch(
             samples,
             orig_target_sizes,
             runner.fixed_batch_size,
         )
-        outputs = runner({"images": samples, "orig_target_sizes": orig_target_sizes})
+        trt_inputs = {"images": samples}
+        if "orig_target_sizes" in runner.input_names:
+            trt_inputs["orig_target_sizes"] = orig_target_sizes
+        outputs = runner(trt_inputs)
 
-        labels = outputs["labels"][:actual_batch_size].long()
-        boxes = outputs["boxes"][:actual_batch_size].float()
-        scores = outputs["scores"][:actual_batch_size].float()
+        labels, boxes, scores = _parse_engine_outputs(
+            outputs,
+            orig_target_sizes,
+            actual_batch_size,
+            cfg,
+            export_mode,
+        )
 
         results = []
         for label, box, score in zip(labels, boxes, scores):
@@ -610,6 +770,7 @@ def main(args) -> None:
             check=args.check,
             simplify=args.simplify,
             strict_load=args.strict_load,
+            export_mode=args.export_mode,
         )
     else:
         print(f"Using existing ONNX: {onnx_path}")
@@ -633,6 +794,7 @@ def main(args) -> None:
                 image_hw=(img_h, img_w),
                 workspace_gb=args.workspace,
                 verbose=args.verbose,
+                profiling_verbosity=args.profiling_verbosity,
             )
             if built is not None:
                 built_engines.append(built)
@@ -643,6 +805,9 @@ def main(args) -> None:
                 raise
 
     if args.no_eval:
+        if args.dump_inspector:
+            for engine_path in built_engines:
+                dump_engine_inspector(engine_path, None, args.verbose)
         return
 
     if not built_engines:
@@ -650,7 +815,9 @@ def main(args) -> None:
 
     eval_cfg = _build_eval_cfg(args)
     for engine_path in built_engines:
-        evaluate_engine(engine_path, eval_cfg, args.score_threshold, args.verbose, args.eval_limit)
+        if args.dump_inspector:
+            dump_engine_inspector(engine_path, None, args.verbose)
+        evaluate_engine(engine_path, eval_cfg, args.score_threshold, args.verbose, args.eval_limit, args.export_mode)
 
 
 def parse_args():
@@ -679,6 +846,16 @@ def parse_args():
     parser.add_argument("--onnx", type=str, default=None, help="Output/input ONNX path.")
     parser.add_argument("--engine-dir", type=str, default=None, help="Directory for TensorRT engines.")
     parser.add_argument(
+        "--export-mode",
+        choices=["pixel", "normalized", "raw"],
+        default="normalized",
+        help=(
+            "ONNX output contract: pixel keeps labels/boxes/scores with pixel boxes and orig_target_sizes input; "
+            "normalized outputs labels/normalized_xyxy_boxes/scores from images only; "
+            "raw outputs pred_logits/pred_boxes from images only."
+        ),
+    )
+    parser.add_argument(
         "--precisions",
         nargs="+",
         default=["fp16", "fp8"],
@@ -686,6 +863,12 @@ def parse_args():
         help="TensorRT precision targets. Use fp32 for no FP16/FP8 quantization.",
     )
     parser.add_argument("--workspace", type=float, default=4.0, help="TensorRT workspace in GB.")
+    parser.add_argument(
+        "--profiling-verbosity",
+        choices=["none", "layer_names_only", "detailed"],
+        default="detailed",
+        help="TensorRT profiling verbosity stored in the engine for inspector dumps.",
+    )
     parser.add_argument("--opset", type=int, default=20)
     parser.add_argument("--min-batch", type=int, default=1)
     parser.add_argument("--opt-batch", type=int, default=1)
@@ -703,6 +886,7 @@ def parse_args():
     parser.add_argument("--simplify", action="store_true", help="Run onnxsim after export.")
     parser.add_argument("--strict-load", action="store_true", help="Require checkpoint tensors to match exactly.")
     parser.add_argument("--strict-fp8", action="store_true", help="Fail if FP8 build is requested but fails.")
+    parser.add_argument("--dump-inspector", action="store_true", help="Dump TensorRT EngineInspector JSON for each engine.")
     parser.add_argument("--verbose", action="store_true", help="Verbose TensorRT logs.")
     return parser.parse_args()
 

@@ -636,7 +636,7 @@ class ECTransformer(nn.Module):
         anchors = torch.concat(anchors, dim=1).to(device)
         valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True)
         anchors = torch.log(anchors / (1 - anchors))
-        anchors = torch.where(valid_mask, anchors, torch.inf)
+        anchors = torch.where(valid_mask, anchors, torch.full_like(anchors, 100.0))
 
         return anchors, valid_mask
 

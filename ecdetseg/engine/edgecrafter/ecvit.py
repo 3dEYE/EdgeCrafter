@@ -247,7 +247,13 @@ class Attention(nn.Module):
             q = torch.cat((q_cls, q_patch), dim=2)
             k = torch.cat((k_cls, k_patch), dim=2)
 
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop)
+        if torch.onnx.is_in_onnx_export():
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = torch.nn.functional.dropout(attn, p=self.attn_drop, training=self.training)
+            x = attn @ v
+        else:
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop)
         x = x.transpose(1, 2).reshape([B, N, C])
         x = self.proj(x)
         x = self.proj_drop(x)

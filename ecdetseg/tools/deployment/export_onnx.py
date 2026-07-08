@@ -20,6 +20,24 @@ import torch.nn as nn
 from engine.core import YAMLConfig
 
 
+def _parse_input_size(input_size):
+    if input_size is None:
+        return None
+    if len(input_size) == 1:
+        h = w = int(input_size[0])
+    elif len(input_size) == 2:
+        h, w = (int(v) for v in input_size)
+    else:
+        raise ValueError("--input-size expects one value S or two values H W.")
+    if h <= 0 or w <= 0:
+        raise ValueError(f"--input-size must be positive, got {h} {w}.")
+    if h != w:
+        raise ValueError("Only square export resolutions are supported for now.")
+    if h % 32 != 0 or w % 32 != 0:
+        raise ValueError(f"--input-size must be divisible by 32, got {h} {w}.")
+    return [h, w]
+
+
 def _box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     cx, cy, w, h = boxes.unbind(-1)
     return torch.stack([
@@ -52,10 +70,41 @@ def _topk_detections(
     return labels, boxes, scores
 
 
+_RESOLUTION_DEPENDENT_STATE_KEYS = {
+    "decoder.anchors",
+    "decoder.valid_mask",
+}
+
+
+def _load_state_dict_for_export(model: nn.Module, state):
+    model_state = model.state_dict()
+    export_state = dict(state)
+    skipped_resolution_keys = []
+    for key in _RESOLUTION_DEPENDENT_STATE_KEYS:
+        if key in export_state and key in model_state and tuple(export_state[key].shape) != tuple(model_state[key].shape):
+            skipped_resolution_keys.append((key, tuple(export_state[key].shape), tuple(model_state[key].shape)))
+            export_state.pop(key)
+    incompatible = model.load_state_dict(export_state, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [key for key in incompatible.missing_keys if key not in _RESOLUTION_DEPENDENT_STATE_KEYS]
+    if unexpected or missing:
+        raise RuntimeError(
+            "Checkpoint loading failed after skipping resolution-dependent buffers:\n"
+            f"  missing: {missing}\n"
+            f"  unexpected: {unexpected}"
+        )
+    for key, src_shape, dst_shape in skipped_resolution_keys:
+        print(f"  skip resolution buffer {key}: checkpoint{src_shape} -> model{dst_shape}")
+
+
 def main(args, ):
     """main
     """
-    cfg = YAMLConfig(args.config, resume=args.resume)
+    cfg_kwargs = {"resume": args.resume}
+    input_size = _parse_input_size(args.input_size)
+    if input_size is not None:
+        cfg_kwargs["eval_spatial_size"] = input_size
+    cfg = YAMLConfig(args.config, **cfg_kwargs)
     
     task = cfg.yaml_cfg['task']
 
@@ -68,7 +117,7 @@ def main(args, ):
             state = checkpoint['model']
 
         # NOTE load train mode state -> convert to deploy mode
-        cfg.model.load_state_dict(state)
+        _load_state_dict_for_export(cfg.model, state)
 
     else:
         # raise AttributeError('Only support resume to load model.state_dict by now.')
@@ -107,6 +156,7 @@ def main(args, ):
     model = Model()
 
     img_size = cfg.yaml_cfg["eval_spatial_size"]
+    print(f"Export spatial size: {img_size[0]}x{img_size[1]}")
     data = torch.rand(args.batch_size, 3, *img_size)
     size = torch.tensor([[img_size[1], img_size[0]]] * args.batch_size, dtype=torch.float32)
 
@@ -179,6 +229,8 @@ if __name__ == '__main__':
                         help='Default normalized exports one images input and labels/normalized_xyxy_boxes/scores outputs.')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Example batch size used during export tracing.')
+    parser.add_argument('--input-size', nargs='+', type=int, default=None,
+                        help='Export resolution. Use S for SxS, or H W. Currently square and divisible by 32.')
     parser.add_argument('--static-batch', action='store_true',
                         help='Export a fixed batch dimension instead of dynamic N.')
     parser.add_argument('--check',  action='store_true')

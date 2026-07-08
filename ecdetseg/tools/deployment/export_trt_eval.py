@@ -21,6 +21,24 @@ from engine.data import CocoEvaluator, get_coco_api_from_dataset
 from engine.misc import MetricLogger
 
 
+def _parse_input_size(input_size: Optional[List[int]]) -> Optional[List[int]]:
+    if input_size is None:
+        return None
+    if len(input_size) == 1:
+        h = w = int(input_size[0])
+    elif len(input_size) == 2:
+        h, w = (int(v) for v in input_size)
+    else:
+        raise ValueError("--input-size expects one value S or two values H W.")
+    if h <= 0 or w <= 0:
+        raise ValueError(f"--input-size must be positive, got {h} {w}.")
+    if h != w:
+        raise ValueError("Only square export/eval resolutions are supported for now.")
+    if h % 32 != 0 or w % 32 != 0:
+        raise ValueError(f"--input-size must be divisible by 32, got {h} {w}.")
+    return [h, w]
+
+
 def _find_data_file(root: Path) -> Path:
     if root.is_file():
         return root
@@ -69,13 +87,35 @@ def _extract_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     return checkpoint
 
 
+_RESOLUTION_DEPENDENT_STATE_KEYS = {
+    "decoder.anchors",
+    "decoder.valid_mask",
+}
+
+
 def _load_checkpoint_model(cfg: YAMLConfig, checkpoint_path: str, strict: bool = False) -> None:
     state = _extract_state_dict(checkpoint_path)
     model_state = cfg.model.state_dict()
 
     if strict:
-        cfg.model.load_state_dict(state)
+        strict_state = dict(state)
+        skipped_resolution_keys = []
+        for key in _RESOLUTION_DEPENDENT_STATE_KEYS:
+            if key in strict_state and key in model_state and tuple(strict_state[key].shape) != tuple(model_state[key].shape):
+                skipped_resolution_keys.append((key, tuple(strict_state[key].shape), tuple(model_state[key].shape)))
+                strict_state.pop(key)
+        incompatible = cfg.model.load_state_dict(strict_state, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = [key for key in incompatible.missing_keys if key not in _RESOLUTION_DEPENDENT_STATE_KEYS]
+        if unexpected or missing:
+            raise RuntimeError(
+                "Strict checkpoint loading failed after skipping resolution-dependent buffers:\n"
+                f"  missing: {missing}\n"
+                f"  unexpected: {unexpected}"
+            )
         print(f"Loaded checkpoint strictly: {checkpoint_path}")
+        for key, src_shape, dst_shape in skipped_resolution_keys:
+            print(f"  skip resolution buffer {key}: checkpoint{src_shape} -> model{dst_shape}")
         return
 
     matched = {}
@@ -326,6 +366,26 @@ def _set_profile(
 
     if has_dynamic_input:
         config.add_optimization_profile(profile)
+
+
+def _read_onnx_image_hw(onnx_file: Path) -> Optional[Tuple[int, int]]:
+    try:
+        import onnx
+    except ImportError:
+        return None
+    model = onnx.load(str(onnx_file), load_external_data=False)
+    for inp in model.graph.input:
+        if inp.name != "images":
+            continue
+        dims = inp.type.tensor_type.shape.dim
+        if len(dims) < 4:
+            return None
+        h = dims[2].dim_value
+        w = dims[3].dim_value
+        if h > 0 and w > 0:
+            return int(h), int(w)
+        return None
+    return None
 
 
 def build_engine(
@@ -630,6 +690,9 @@ def _parse_engine_outputs(
 
 def _build_eval_cfg(args) -> YAMLConfig:
     update = parse_cli(args.update)
+    input_size = _parse_input_size(args.input_size)
+    if input_size is not None:
+        update = merge_dict(update, {"eval_spatial_size": input_size})
     if args.data is not None:
         if not hasattr(args, "_resolved_yolo_data"):
             args._resolved_yolo_data = resolve_yolo_data(args.data)
@@ -756,6 +819,7 @@ def main(args) -> None:
 
     cfg = _build_eval_cfg(args)
     img_h, img_w = cfg.yaml_cfg["eval_spatial_size"]
+    print(f"Export/eval spatial size: {img_h}x{img_w}")
     onnx_path = Path(args.onnx) if args.onnx else _default_onnx_path(args.resume)
 
     if not args.skip_onnx or not onnx_path.exists():
@@ -774,6 +838,13 @@ def main(args) -> None:
         )
     else:
         print(f"Using existing ONNX: {onnx_path}")
+
+    onnx_hw = _read_onnx_image_hw(onnx_path)
+    if onnx_hw is not None and onnx_hw != (img_h, img_w):
+        raise ValueError(
+            f"ONNX images input is {onnx_hw[0]}x{onnx_hw[1]}, but requested/configured "
+            f"resolution is {img_h}x{img_w}. Re-export ONNX or use matching --input-size."
+        )
 
     built_engines: List[Path] = []
     for precision in args.precisions:
@@ -870,6 +941,13 @@ def parse_args():
         help="TensorRT profiling verbosity stored in the engine for inspector dumps.",
     )
     parser.add_argument("--opset", type=int, default=20)
+    parser.add_argument(
+        "--input-size",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Export/eval resolution. Use S for SxS, or H W. Currently square and divisible by 32.",
+    )
     parser.add_argument("--min-batch", type=int, default=1)
     parser.add_argument("--opt-batch", type=int, default=1)
     parser.add_argument("--max-batch", type=int, default=1)

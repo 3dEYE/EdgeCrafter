@@ -16,10 +16,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
+import yaml
 from PIL import Image
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 from engine.core import YAMLConfig
+from engine.core.yaml_utils import merge_dict, parse_cli
 from engine.data.dataset.coco_dataset import mscoco_label2name_remap80
 
 
@@ -52,6 +54,64 @@ COCO_COLORS = [
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _BOUNDARY_KERNEL_CACHE: dict[int, np.ndarray] = {}
+_CLASS_NAMES = mscoco_label2name_remap80
+
+
+_RESOLUTION_DEPENDENT_STATE_KEYS = {
+    "decoder.anchors",
+    "decoder.valid_mask",
+}
+
+
+def _parse_input_size(input_size):
+    if input_size is None:
+        return None
+    if len(input_size) == 1:
+        h = w = int(input_size[0])
+    elif len(input_size) == 2:
+        h, w = (int(v) for v in input_size)
+    else:
+        raise ValueError("--input-size expects one value S or two values H W.")
+    if h <= 0 or w <= 0:
+        raise ValueError(f"--input-size must be positive, got {h} {w}.")
+    if h != w:
+        raise ValueError("Only square inference resolutions are supported for now.")
+    if h % 32 != 0 or w % 32 != 0:
+        raise ValueError(f"--input-size must be divisible by 32, got {h} {w}.")
+    return [h, w]
+
+
+def _find_yolo_data_file(data: str) -> Path:
+    path = Path(data).expanduser()
+    if path.is_file():
+        return path
+    for name in ("data.yaml", "data.yml", "data_win.yaml", "dataset.yaml", "dataset.yml"):
+        candidate = path / name
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Can not find YOLO data.yaml under: {path}")
+
+
+def _resolve_yolo_data(data: str):
+    data_arg = Path(data).expanduser()
+    data_file = _find_yolo_data_file(data)
+    with data_file.open("r", encoding="utf-8") as f:
+        data_cfg = yaml.safe_load(f) or {}
+    root = data_arg if data_arg.is_dir() else data_file.parent
+    return root, data_file, data_cfg
+
+
+def _class_names_from_yolo(data_cfg: dict):
+    names = data_cfg.get("names", None)
+    if isinstance(names, dict):
+        return {int(k): str(v) for k, v in names.items()}
+    if isinstance(names, (list, tuple)):
+        return {i: str(v) for i, v in enumerate(names)}
+    return None
+
+
+def _class_name(label: int) -> str:
+    return _CLASS_NAMES.get(label, str(label))
 
 
 def get_class_color(label: int):
@@ -118,7 +178,7 @@ def draw_to_numpy(image: Image.Image, results: list[Result], alpha: float = 0.5)
         y2 = min(im_np.shape[0] - 1, y2)
 
         cv2.rectangle(im_np, (x1, y1), (x2, y2), color_rgb, box_thickness)
-        text = f"{mscoco_label2name_remap80.get(res.label, str(res.label))} {res.score:.2f}"
+        text = f"{_class_name(res.label)} {res.score:.2f}"
         (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
 
         text_x = x1
@@ -342,13 +402,37 @@ def process_video(inferencer: ECInferencer, path: Path, num_workers: int = 4):
     print(f"Saved video result to {output_path}")
 
 
-def build_model(config_path: str, resume_path: str, device: torch.device):
-    cfg = YAMLConfig(config_path, resume=resume_path)
-    cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
+def _load_model_state(model: nn.Module, state):
+    model_state = model.state_dict()
+    load_state = dict(state)
+    skipped_resolution_keys = []
+    for key in _RESOLUTION_DEPENDENT_STATE_KEYS:
+        if key in load_state and key in model_state and tuple(load_state[key].shape) != tuple(model_state[key].shape):
+            skipped_resolution_keys.append((key, tuple(load_state[key].shape), tuple(model_state[key].shape)))
+            load_state.pop(key)
+
+    incompatible = model.load_state_dict(load_state, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [key for key in incompatible.missing_keys if key not in _RESOLUTION_DEPENDENT_STATE_KEYS]
+    if unexpected or missing:
+        raise RuntimeError(
+            "Checkpoint loading failed after skipping resolution-dependent buffers:\n"
+            f"  missing: {missing}\n"
+            f"  unexpected: {unexpected}"
+        )
+    for key, src_shape, dst_shape in skipped_resolution_keys:
+        print(f"  skip resolution buffer {key}: checkpoint{src_shape} -> model{dst_shape}")
+
+
+def build_model(config_path: str, resume_path: str, device: torch.device, update=None):
+    cfg_kwargs = merge_dict({"resume": resume_path}, update or {}, inplace=False)
+    cfg = YAMLConfig(config_path, **cfg_kwargs)
+    if "ViTAdapter" in cfg.yaml_cfg:
+        cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
 
     checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
     state = checkpoint["ema"]["module"] if "ema" in checkpoint else checkpoint["model"]
-    cfg.model.load_state_dict(state)
+    _load_model_state(cfg.model, state)
 
     class Model(nn.Module):
         def __init__(self):
@@ -367,8 +451,29 @@ def build_model(config_path: str, resume_path: str, device: torch.device):
 
 
 def main(args):
+    global _CLASS_NAMES
+
     device = torch.device(args.device)
-    model, img_size, task = build_model(args.config, args.resume, device)
+    update = parse_cli(args.update)
+
+    input_size = _parse_input_size(args.input_size)
+    if input_size is not None:
+        update = merge_dict(update, {"eval_spatial_size": input_size})
+
+    if args.data is not None:
+        yolo_root, yolo_data_file, data_cfg = _resolve_yolo_data(args.data)
+        update = merge_dict(update, {
+            "yolo_root": str(yolo_root),
+            "yolo_data_file": str(yolo_data_file),
+        })
+        class_names = _class_names_from_yolo(data_cfg)
+        if class_names is not None:
+            _CLASS_NAMES = class_names
+        print(f"YOLO data file: {yolo_data_file}")
+        print(f"YOLO dataset root: {yolo_root}")
+
+    model, img_size, task = build_model(args.config, args.resume, device, update)
+    print(f"Inference spatial size: {img_size[0]}x{img_size[1]}")
 
     inferencer = ECInferencer(
         model=model,
@@ -397,6 +502,15 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-r", "--resume", required=True)
     parser.add_argument("-i", "--input", required=True, help="Image path, image directory path, or video path")
+    parser.add_argument("--data", default=None, help="YOLO dataset root or data.yaml for custom class names/classes.")
+    parser.add_argument("-u", "--update", nargs="*", default=[], help="YAML overrides, e.g. yolo_root=/data/ds.")
+    parser.add_argument(
+        "--input-size",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Inference resolution. Use S for SxS, or H W. Currently square and divisible by 32.",
+    )
     parser.add_argument(
         "-d",
         "--device",

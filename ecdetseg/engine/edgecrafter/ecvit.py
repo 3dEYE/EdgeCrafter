@@ -388,11 +388,13 @@ class ViTAdapter(nn.Module):
         ffn_layer='mlp',
         ffn_ratio=4,
         skip_load_backbone=False,
+        freeze_backbone=False,
         **kwargs
     ):
         super().__init__()
         
         self.name = name
+        self.freeze_backbone = freeze_backbone
         
         if embed_layer not in EMBED_LAYER_REGISTRY:
             raise ValueError(f"Unknown embed_layer: {embed_layer}. Available: {list(EMBED_LAYER_REGISTRY)}")
@@ -412,6 +414,11 @@ class ViTAdapter(nn.Module):
                                           **kwargs)
         if not skip_load_backbone:
             self._load_weights(weights_path)
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+            self.backbone.eval()
+            print("Freeze ViT backbone parameters.")
             
         self.interaction_indexes = interaction_indexes
         self.patch_size = patch_size
@@ -423,6 +430,12 @@ class ViTAdapter(nn.Module):
         self.proj_dim = [proj_dim] * num_levels if proj_dim is not None else [embed_dim]
 
         self.projector = nn.ModuleList([ConvNormLayer_fuse(embed_dim, dim, kernel_size=1, stride=1) for dim in self.proj_dim])
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
         
     def _load_weights(self, weights_path):
         if self.name not in self.ecvit_url:

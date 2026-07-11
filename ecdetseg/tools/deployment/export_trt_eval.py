@@ -929,7 +929,7 @@ def parse_args():
     parser.add_argument(
         "--precisions",
         nargs="+",
-        default=["fp16", "fp8"],
+        default=["fp16"],
         choices=["fp32", "fp16", "fp8"],
         help="TensorRT precision targets. Use fp32 for no FP16/FP8 quantization.",
     )

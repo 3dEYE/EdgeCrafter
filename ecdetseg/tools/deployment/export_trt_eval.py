@@ -165,8 +165,9 @@ def _topk_detections(
     num_classes: int,
     num_top_queries: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    scores = torch.sigmoid(logits)
-    scores, flat_index = torch.topk(scores.flatten(1), num_top_queries, dim=-1)
+    # Sigmoid is monotonic; select logits first to avoid FP16 saturation before TopK.
+    scores, flat_index = torch.topk(logits.flatten(1), num_top_queries, dim=-1)
+    scores = torch.sigmoid(scores)
     labels = (flat_index - flat_index // num_classes * num_classes).to(torch.int32)
     box_index = flat_index // num_classes
     boxes = _batch_index_select(_box_cxcywh_to_xyxy(boxes), box_index)

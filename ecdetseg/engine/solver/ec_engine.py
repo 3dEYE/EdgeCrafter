@@ -20,6 +20,17 @@ from ..misc import MetricLogger, SmoothedValue, dist_utils
 from ..optim import ModelEMA
 
 
+def _input_torch_dtype(input_dtype: str) -> torch.dtype:
+    mapping = {
+        'float32': torch.float32,
+        'float16': torch.float16,
+    }
+    try:
+        return mapping[input_dtype]
+    except KeyError as exc:
+        raise ValueError(f'Unsupported input dtype: {input_dtype}') from exc
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -35,17 +46,21 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     ema :ModelEMA = kwargs.get('ema', None)
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler = kwargs.get('lr_warmup_scheduler', None)
+    input_dtype = kwargs.get('input_dtype', 'float32')
+    sample_dtype = _input_torch_dtype(input_dtype)
+    if sample_dtype == torch.float16 and scaler is None:
+        raise ValueError('float16 input training requires AMP/GradScaler to be enabled')
 
     cur_iters = epoch * len(data_loader)
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        samples = samples.to(device)
+        samples = samples.to(device=device, dtype=sample_dtype, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
         if scaler is not None:
-            with torch.autocast(device_type=str(device), cache_enabled=True):
+            with torch.autocast(device_type=device.type, dtype=torch.float16, cache_enabled=True):
                 outputs = model(samples, targets=targets)
 
             if torch.isnan(outputs['pred_boxes']).any() or torch.isinf(outputs['pred_boxes']).any():
@@ -122,7 +137,16 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+def evaluate(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader,
+    coco_evaluator: CocoEvaluator,
+    device,
+    input_dtype: str = 'float32',
+    use_amp: bool = False,
+):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
@@ -133,14 +157,23 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
     # iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessor.keys())
     iou_types = coco_evaluator.iou_types
+    sample_dtype = _input_torch_dtype(input_dtype)
+    if sample_dtype == torch.float16 and not use_amp:
+        raise ValueError('float16 input evaluation requires AMP to be enabled')
     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
-        samples = samples.to(device)
+        samples = samples.to(device=device, dtype=sample_dtype, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=use_amp,
+            cache_enabled=True,
+        ):
+            outputs = model(samples)
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 

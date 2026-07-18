@@ -210,5 +210,10 @@ __marimo__/
 *.pt
 *.pth
 *.onnx
+*.engine
+*.engine.inspector.json
+*.engine.manifest.json
+events.out.tfevents.*
+outputs/
 *.zip
 .DS_Store

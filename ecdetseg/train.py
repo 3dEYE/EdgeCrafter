@@ -96,6 +96,12 @@ def main(args, ) -> None:
 
     cfg = YAMLConfig(args.config, **update_dict)
 
+    if cfg.input_dtype == 'float16' and not cfg.use_amp:
+        raise ValueError(
+            'float16 input requires AMP; keep the defaults or use '
+            '--no-amp together with --input-dtype float32'
+        )
+
     if args.resume or args.tuning:
         if 'ViTAdapter' in cfg.yaml_cfg:
             cfg.yaml_cfg['ViTAdapter']['skip_load_backbone'] = True
@@ -128,7 +134,16 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint')
     parser.add_argument('-d', '--device', type=str, help='device',)
     parser.add_argument('--seed', type=int, default=0, help='exp reproducibility')
-    parser.add_argument('--use-amp', action='store_true', help='auto mixed precision training')
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument('--use-amp', dest='use_amp', action='store_true', help='enable mixed precision training (default)')
+    amp_group.add_argument('--no-amp', dest='use_amp', action='store_false', help='disable mixed precision training')
+    parser.set_defaults(use_amp=True)
+    parser.add_argument(
+        '--input-dtype',
+        choices=['float32', 'float16'],
+        default='float16',
+        help='Image dtype used at the training device boundary (default: float16).',
+    )
     parser.add_argument('--output-dir', type=str, help='output directoy')
     parser.add_argument('--summary-dir', type=str, help='tensorboard summry')
     parser.add_argument('--test-only', action='store_true', default=False,)

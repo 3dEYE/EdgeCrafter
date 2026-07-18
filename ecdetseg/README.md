@@ -259,6 +259,23 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
 
 Replace `{SIZE}` with `s`, `m`, `l`, or `x` based on your chosen model size.
 
+Training uses AMP with an explicit FP16 image input by default for every
+detection and segmentation config:
+
+```bash
+python train.py -c configs/ecdet/ecdet_m_yolo.yml -t ecdet_m.pth \
+  -u yolo_root=/home/ec2-user/GunsDataset \
+  output_dir=outputs/ecdet_m_guns_dataset \
+  "eval_spatial_size=[256,256]" \
+  train_dataloader.total_batch_size=16 \
+  val_dataloader.total_batch_size=16
+```
+
+`eval_spatial_size` also updates the training and validation resize transforms
+and the Mosaic source size when the configuration is resolved.
+
+For a diagnostic full-FP32 run, explicitly use `--no-amp --input-dtype float32`.
+
 ### Evaluation
 
 Evaluate a trained model:

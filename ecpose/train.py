@@ -9,9 +9,13 @@ Modified from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright (c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import json
 import os
+import shlex
 import sys
 import warnings
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
@@ -33,6 +37,48 @@ if debug:
     original_repr = torch.Tensor.__repr__
     torch.Tensor.__repr__ = custom_repr
 
+
+def save_run_args(args, cfg) -> None:
+    command_argv = getattr(sys, 'orig_argv', None) or [sys.executable, *sys.argv]
+    run = {
+        'started_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'working_directory': os.getcwd(),
+        'command': shlex.join(command_argv),
+        'argv': list(sys.argv),
+        'args': vars(args),
+        'resolved_config': cfg.yaml_cfg,
+        'distributed': {
+            'world_size': dist_utils.get_world_size(),
+            'local_world_size': os.environ.get('LOCAL_WORLD_SIZE'),
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        },
+    }
+
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args_path = output_dir / 'args.json'
+    metadata = {'runs': []}
+    if args_path.exists():
+        try:
+            with args_path.open('r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            if not isinstance(metadata, dict) or not isinstance(metadata.get('runs'), list):
+                raise ValueError('expected an object with a runs array')
+        except (json.JSONDecodeError, ValueError) as exc:
+            backup_name = f'args.invalid-{datetime.now():%Y%m%dT%H%M%S%f}.json'
+            backup_path = args_path.with_name(backup_name)
+            args_path.replace(backup_path)
+            print(f'Warning: invalid {args_path} was moved to {backup_path}: {exc}')
+            metadata = {'runs': []}
+
+    metadata['runs'].append(run)
+    temp_path = args_path.with_suffix('.json.tmp')
+    with temp_path.open('w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2, default=str)
+        f.write('\n')
+    temp_path.replace(args_path)
+
+
 def main(args, ) -> None:
     """main
     """
@@ -53,6 +99,12 @@ def main(args, ) -> None:
             cfg.yaml_cfg['ViTAdapter']['skip_load_backbone'] = True
 
     print('cfg: ', cfg.__dict__)
+
+    if not args.test_only and dist_utils.is_main_process():
+        try:
+            save_run_args(args, cfg)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f'Warning: could not save training arguments: {exc}')
 
     solver = TASKS[cfg.yaml_cfg['task']](cfg)
 

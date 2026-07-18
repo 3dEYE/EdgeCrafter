@@ -3,6 +3,8 @@ Export EdgeCrafter checkpoints to TensorRT and evaluate mAP on the validation se
 """
 
 import argparse
+import hashlib
+import json
 import os
 import sys
 from collections import OrderedDict
@@ -159,6 +161,12 @@ def _batch_index_select(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return selected.reshape(batch_size, index.shape[1], *x.shape[2:])
 
 
+def _configured_num_top_queries(cfg: YAMLConfig) -> int:
+    postprocessor = cfg.yaml_cfg["postprocessor"]
+    postprocessor_cfg = cfg.yaml_cfg[postprocessor] if isinstance(postprocessor, str) else postprocessor
+    return int(postprocessor_cfg["num_top_queries"])
+
+
 def _topk_detections(
     logits: torch.Tensor,
     boxes: torch.Tensor,
@@ -175,16 +183,24 @@ def _topk_detections(
 
 
 class DeployModel(nn.Module):
-    def __init__(self, cfg: YAMLConfig, export_mode: str) -> None:
+    def __init__(self, cfg: YAMLConfig, export_mode: str, input_dtype: str = "float16") -> None:
         super().__init__()
         self.model = cfg.model.deploy()
+        if input_dtype not in ("float32", "float16"):
+            raise ValueError(f"Unsupported input dtype: {input_dtype}")
+        self.input_dtype = input_dtype
         self.export_mode = export_mode
         self.num_classes = int(cfg.yaml_cfg["num_classes"])
-        self.num_top_queries = int(cfg.postprocessor.num_top_queries)
+        self.num_top_queries = _configured_num_top_queries(cfg)
         if export_mode == "pixel":
             self.postprocessor = cfg.postprocessor.deploy()
 
     def forward(self, images: torch.Tensor, orig_target_sizes: Optional[torch.Tensor] = None):
+        if self.input_dtype == "float16":
+            # Preserve the baseline model graph while making HALF the external
+            # contract. The input values remain FP16-quantized; TensorRT may fold
+            # this widening cast into its first FP16 convolution tactic.
+            images = images.float()
         outputs = self.model(images)
         if self.export_mode == "raw":
             return outputs["pred_logits"], outputs["pred_boxes"]
@@ -216,14 +232,16 @@ def export_onnx(
     simplify: bool,
     strict_load: bool,
     export_mode: str,
+    input_dtype: str = "float16",
 ) -> Path:
     if "ViTAdapter" in cfg.yaml_cfg:
         cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
     _load_checkpoint_model(cfg, checkpoint, strict=strict_load)
 
-    model = DeployModel(cfg, export_mode).eval()
+    model = DeployModel(cfg, export_mode, input_dtype=input_dtype).eval()
     img_h, img_w = cfg.yaml_cfg["eval_spatial_size"]
-    images = torch.rand(batch_size, 3, img_h, img_w)
+    image_dtype = torch.float16 if input_dtype == "float16" else torch.float32
+    images = torch.rand(batch_size, 3, img_h, img_w, dtype=image_dtype)
     orig_target_sizes = torch.tensor([[img_w, img_h]] * batch_size, dtype=torch.float32)
     task = cfg.yaml_cfg["task"]
 
@@ -369,24 +387,95 @@ def _set_profile(
         config.add_optimization_profile(profile)
 
 
-def _read_onnx_image_hw(onnx_file: Path) -> Optional[Tuple[int, int]]:
+def _onnx_dtype_name(onnx, elem_type: int) -> str:
+    mapping = {
+        onnx.TensorProto.FLOAT: "float32",
+        onnx.TensorProto.FLOAT16: "float16",
+        onnx.TensorProto.INT32: "int32",
+        onnx.TensorProto.INT64: "int64",
+        onnx.TensorProto.BOOL: "bool",
+    }
+    dtype_name = mapping.get(elem_type)
+    if dtype_name is None:
+        raise TypeError(f"Unsupported ONNX tensor dtype: {onnx.TensorProto.DataType.Name(elem_type)}")
+    return dtype_name
+
+
+def _onnx_tensor_shape(value_info) -> Tuple[int, ...]:
+    return tuple(int(dim.dim_value) if dim.dim_value > 0 else -1 for dim in value_info.type.tensor_type.shape.dim)
+
+
+def _read_onnx_contract(onnx_file: Path) -> Dict[str, object]:
     try:
         import onnx
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise RuntimeError("The onnx package is required to validate the input contract") from exc
     model = onnx.load(str(onnx_file), load_external_data=False)
-    for inp in model.graph.input:
-        if inp.name != "images":
-            continue
-        dims = inp.type.tensor_type.shape.dim
-        if len(dims) < 4:
-            return None
-        h = dims[2].dim_value
-        w = dims[3].dim_value
-        if h > 0 and w > 0:
-            return int(h), int(w)
-        return None
-    return None
+    inputs = {
+        value.name: _onnx_dtype_name(onnx, value.type.tensor_type.elem_type)
+        for value in model.graph.input
+    }
+    outputs = {
+        value.name: _onnx_dtype_name(onnx, value.type.tensor_type.elem_type)
+        for value in model.graph.output
+    }
+    input_shapes = {value.name: _onnx_tensor_shape(value) for value in model.graph.input}
+    output_shapes = {value.name: _onnx_tensor_shape(value) for value in model.graph.output}
+    if "images" not in inputs:
+        raise KeyError(f"ONNX model has no 'images' input: {onnx_file}")
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+        "input_shapes": input_shapes,
+        "output_shapes": output_shapes,
+    }
+
+
+def _expected_io_dtypes(task: str, export_mode: str, input_dtype: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    if task == "segmentation" and export_mode != "pixel":
+        raise NotImplementedError(f"--export-mode {export_mode} is only implemented for detection.")
+
+    inputs = {"images": input_dtype}
+    if export_mode == "pixel":
+        inputs["orig_target_sizes"] = "float32"
+
+    if export_mode == "raw":
+        outputs = {"pred_logits": "float32", "pred_boxes": "float32"}
+    else:
+        outputs = {"labels": "int32", "boxes": "float32", "scores": "float32"}
+        if task == "segmentation":
+            outputs["masks"] = "float32"
+    return inputs, outputs
+
+
+def _validate_onnx_contract(
+    contract: Dict[str, object],
+    task: str,
+    export_mode: str,
+    input_dtype: str,
+    image_hw: Tuple[int, int],
+    static_batch: bool,
+    opt_batch: int,
+) -> None:
+    expected_inputs, expected_outputs = _expected_io_dtypes(task, export_mode, input_dtype)
+    if contract["inputs"] != expected_inputs:
+        raise ValueError(f"ONNX input contract mismatch: got {contract['inputs']}, expected {expected_inputs}")
+    if contract["outputs"] != expected_outputs:
+        raise ValueError(f"ONNX output contract mismatch: got {contract['outputs']}, expected {expected_outputs}")
+
+    input_shapes = contract["input_shapes"]
+    image_shape = input_shapes["images"]
+    expected_batch = opt_batch if static_batch else -1
+    expected_image_shape = (expected_batch, 3, image_hw[0], image_hw[1])
+    if image_shape != expected_image_shape:
+        raise ValueError(f"ONNX images shape mismatch: got {image_shape}, expected {expected_image_shape}")
+    if "orig_target_sizes" in expected_inputs:
+        expected_size_shape = (expected_batch, 2)
+        if input_shapes.get("orig_target_sizes") != expected_size_shape:
+            raise ValueError(
+                f"ONNX orig_target_sizes shape mismatch: got {input_shapes.get('orig_target_sizes')}, "
+                f"expected {expected_size_shape}"
+            )
 
 
 def build_engine(
@@ -508,6 +597,207 @@ def _torch_dtype_from_trt(trt, dtype):
     return mapping[np.dtype(np_dtype)]
 
 
+def _dtype_name(dtype: torch.dtype) -> str:
+    mapping = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.bool: "bool",
+    }
+    if dtype not in mapping:
+        raise TypeError(f"Unsupported tensor dtype: {dtype}")
+    return mapping[dtype]
+
+
+def _shape_tuple(shape) -> Tuple[int, ...]:
+    return tuple(int(dim) for dim in shape)
+
+
+def _profile_tuple(profile) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+    return tuple(_shape_tuple(shape) for shape in profile)
+
+
+def _read_engine_contract(engine_path: Path, verbose: bool) -> Dict[str, object]:
+    import tensorrt as trt
+
+    logger = _trt_logger(trt, verbose)
+    trt.init_libnvinfer_plugins(logger, "")
+    with engine_path.open("rb") as f, trt.Runtime(logger) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            raise RuntimeError(f"Failed to deserialize TensorRT engine: {engine_path}")
+
+        profile_count = max(int(getattr(engine, "num_optimization_profiles", 1)), 1)
+        inputs: Dict[str, str] = {}
+        outputs: Dict[str, str] = {}
+        input_shapes: Dict[str, Tuple[int, ...]] = {}
+        output_shapes: Dict[str, Tuple[int, ...]] = {}
+        profiles: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = {}
+
+        named_api = all(hasattr(engine, attr) for attr in (
+            "num_io_tensors",
+            "get_tensor_name",
+            "get_tensor_mode",
+            "get_tensor_dtype",
+            "get_tensor_shape",
+        ))
+        if named_api:
+            for i in range(engine.num_io_tensors):
+                name = engine.get_tensor_name(i)
+                dtype = _dtype_name(_torch_dtype_from_trt(trt, engine.get_tensor_dtype(name)))
+                shape = _shape_tuple(engine.get_tensor_shape(name))
+                if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    inputs[name] = dtype
+                    input_shapes[name] = shape
+                    if any(dim < 0 for dim in shape):
+                        if not hasattr(engine, "get_tensor_profile_shape"):
+                            raise RuntimeError("TensorRT named I/O API has no profile-shape query support.")
+                        profiles[name] = _profile_tuple(engine.get_tensor_profile_shape(name, 0))
+                else:
+                    outputs[name] = dtype
+                    output_shapes[name] = shape
+        else:
+            bindings_per_profile = engine.num_bindings // profile_count
+            for i in range(bindings_per_profile):
+                name = engine.get_binding_name(i)
+                dtype = _dtype_name(_torch_dtype_from_trt(trt, engine.get_binding_dtype(i)))
+                shape = _shape_tuple(engine.get_binding_shape(i))
+                if engine.binding_is_input(i):
+                    if hasattr(engine, "is_shape_binding") and engine.is_shape_binding(i):
+                        raise TypeError(f"TensorRT shape input is not supported for reuse validation: {name}")
+                    inputs[name] = dtype
+                    input_shapes[name] = shape
+                    if any(dim < 0 for dim in shape):
+                        profiles[name] = _profile_tuple(engine.get_profile_shape(0, i))
+                else:
+                    outputs[name] = dtype
+                    output_shapes[name] = shape
+
+    if "images" not in inputs:
+        raise KeyError(f"TensorRT engine has no 'images' input: {engine_path}")
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+        "input_shapes": input_shapes,
+        "output_shapes": output_shapes,
+        "profiles": profiles,
+        "profile_count": profile_count,
+    }
+
+
+def _validate_batch_request(
+    static_batch: bool,
+    min_batch: int,
+    opt_batch: int,
+    max_batch: int,
+    eval_batch_size: Optional[int] = None,
+) -> None:
+    if not 1 <= min_batch <= opt_batch <= max_batch:
+        raise ValueError(
+            f"Invalid batch profile: require 1 <= min <= opt <= max, got "
+            f"{min_batch}/{opt_batch}/{max_batch}"
+        )
+    if static_batch and not min_batch == opt_batch == max_batch:
+        raise ValueError(
+            "Static batch requires --min-batch, --opt-batch and --max-batch to be equal, "
+            f"got {min_batch}/{opt_batch}/{max_batch}"
+        )
+    if eval_batch_size is not None:
+        valid_eval_batch = (
+            eval_batch_size == opt_batch
+            if static_batch
+            else min_batch <= eval_batch_size <= max_batch
+        )
+        if not valid_eval_batch:
+            raise ValueError(
+                f"Evaluation batch size {eval_batch_size} is outside the requested "
+                f"{'static batch' if static_batch else 'profile'} {min_batch}/{opt_batch}/{max_batch}"
+            )
+
+
+def _validate_engine_contract(
+    engine_contract: Dict[str, object],
+    onnx_contract: Dict[str, object],
+    image_hw: Tuple[int, int],
+    static_batch: bool,
+    min_batch: int,
+    opt_batch: int,
+    max_batch: int,
+) -> None:
+    _validate_batch_request(static_batch, min_batch, opt_batch, max_batch)
+    if engine_contract["profile_count"] != 1:
+        raise ValueError(
+            f"TensorRT runner requires exactly one optimization profile, got {engine_contract['profile_count']}"
+        )
+
+    for key in ("inputs", "outputs", "input_shapes"):
+        if engine_contract[key] != onnx_contract[key]:
+            raise ValueError(
+                f"TensorRT {key} contract mismatch: got {engine_contract[key]}, "
+                f"expected {onnx_contract[key]}"
+            )
+
+    engine_output_shapes = engine_contract["output_shapes"]
+    onnx_output_shapes = onnx_contract["output_shapes"]
+    if engine_output_shapes.keys() != onnx_output_shapes.keys():
+        raise ValueError(
+            f"TensorRT output shape names mismatch: got {engine_output_shapes.keys()}, "
+            f"expected {onnx_output_shapes.keys()}"
+        )
+    for name, onnx_shape in onnx_output_shapes.items():
+        engine_shape = engine_output_shapes[name]
+        compatible = len(engine_shape) == len(onnx_shape) and all(
+            expected < 0 or actual == expected
+            for actual, expected in zip(engine_shape, onnx_shape)
+        )
+        if not compatible:
+            raise ValueError(
+                f"TensorRT output shape mismatch for {name}: got {engine_shape}, "
+                f"expected ONNX-compatible {onnx_shape}"
+            )
+
+    expected_profiles = {}
+    if not static_batch:
+        img_h, img_w = image_hw
+        expected_profiles["images"] = (
+            (min_batch, 3, img_h, img_w),
+            (opt_batch, 3, img_h, img_w),
+            (max_batch, 3, img_h, img_w),
+        )
+        if "orig_target_sizes" in onnx_contract["inputs"]:
+            expected_profiles["orig_target_sizes"] = (
+                (min_batch, 2),
+                (opt_batch, 2),
+                (max_batch, 2),
+            )
+    if engine_contract["profiles"] != expected_profiles:
+        raise ValueError(
+            f"TensorRT optimization profile mismatch: got {engine_contract['profiles']}, "
+            f"expected {expected_profiles}"
+        )
+
+
+def _validate_engine_top_queries(
+    engine_contract: Dict[str, object],
+    export_mode: str,
+    num_top_queries: int,
+) -> None:
+    if export_mode == "raw":
+        return
+    if num_top_queries <= 0:
+        raise ValueError(f"num_top_queries must be positive, got {num_top_queries}")
+
+    output_shapes = engine_contract["output_shapes"]
+    for name in ("labels", "boxes", "scores"):
+        shape = output_shapes[name]
+        if len(shape) < 2 or shape[1] != num_top_queries:
+            raise ValueError(
+                f"TensorRT {name} output has {shape[1] if len(shape) >= 2 else 'no'} query dimension, "
+                f"expected {num_top_queries}: shape={shape}"
+            )
+
+
 class TRTInference:
     def __init__(self, engine_path: Path, device: str = "cuda", verbose: bool = False) -> None:
         import tensorrt as trt
@@ -576,13 +866,32 @@ class TRTInference:
             return self.engine.get_tensor_dtype(name)
         return self.engine.get_binding_dtype(self._binding_index(name))
 
+    def input_torch_dtype(self, name: str) -> torch.dtype:
+        if name not in self.input_names:
+            raise KeyError(f"Unknown TensorRT input: {name}")
+        return _torch_dtype_from_trt(self.trt, self._get_tensor_dtype(name))
+
     def __call__(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         stream = torch.cuda.current_stream().cuda_stream
-        inputs = {name: tensor.contiguous().to(self.device) for name, tensor in inputs.items()}
-
         for name in self.input_names:
             if name not in inputs:
                 raise KeyError(f"Missing TensorRT input: {name}")
+        unexpected = sorted(set(inputs) - set(self.input_names))
+        if unexpected:
+            raise KeyError(f"Unexpected TensorRT inputs: {unexpected}")
+
+        prepared_inputs = {}
+        for name, tensor in inputs.items():
+            expected_dtype = self.input_torch_dtype(name)
+            if tensor.dtype != expected_dtype:
+                raise TypeError(
+                    f"TensorRT input {name!r} expects {expected_dtype}, got {tensor.dtype}. "
+                    "Convert it at the producer/host boundary before H2D."
+                )
+            prepared_inputs[name] = tensor.contiguous().to(device=self.device, non_blocking=True)
+        inputs = prepared_inputs
+
+        for name in self.input_names:
             input_shape = tuple(inputs[name].shape)
             if self._is_dynamic_input(name):
                 self._set_input_shape(name, input_shape)
@@ -637,6 +946,22 @@ def _pad_static_batch(
     return samples.contiguous(), orig_target_sizes.contiguous(), actual_batch_size
 
 
+def _cast_host_tensor(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.device.type != "cpu":
+        raise ValueError(f"Expected a CPU tensor before H2D, got {tensor.device}")
+    if tensor.dtype == dtype:
+        return tensor.contiguous()
+
+    converted = torch.empty(
+        tuple(tensor.shape),
+        dtype=dtype,
+        device="cpu",
+        pin_memory=tensor.is_pinned(),
+    )
+    converted.copy_(tensor)
+    return converted
+
+
 def _apply_eval_limit(dataset, eval_limit: Optional[int]) -> None:
     if eval_limit is None:
         return
@@ -674,7 +999,7 @@ def _parse_engine_outputs(
             pred_logits,
             pred_boxes,
             int(cfg.yaml_cfg["num_classes"]),
-            int(cfg.postprocessor.num_top_queries),
+            _configured_num_top_queries(cfg),
         )
         boxes = _scale_normalized_boxes(boxes, orig_target_sizes)
         return labels.long(), boxes.float(), scores.float()
@@ -741,13 +1066,20 @@ def evaluate_engine(
 
     metric_logger = MetricLogger(delimiter="  ")
     for samples, targets in metric_logger.log_every(val_loader, 10, f"TensorRT eval {engine_path.name}:"):
-        samples = samples.to(device, non_blocking=True)
-        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device).float()
+        samples = _cast_host_tensor(samples, runner.input_torch_dtype("images"))
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        target_size_dtype = (
+            runner.input_torch_dtype("orig_target_sizes")
+            if "orig_target_sizes" in runner.input_names
+            else torch.float32
+        )
+        orig_target_sizes = _cast_host_tensor(orig_target_sizes, target_size_dtype)
         samples, orig_target_sizes, actual_batch_size = _pad_static_batch(
             samples,
             orig_target_sizes,
             runner.fixed_batch_size,
         )
+        orig_target_sizes_device = orig_target_sizes.to(device, dtype=torch.float32, non_blocking=True)
         trt_inputs = {"images": samples}
         if "orig_target_sizes" in runner.input_names:
             trt_inputs["orig_target_sizes"] = orig_target_sizes
@@ -755,7 +1087,7 @@ def evaluate_engine(
 
         labels, boxes, scores = _parse_engine_outputs(
             outputs,
-            orig_target_sizes,
+            orig_target_sizes_device,
             actual_batch_size,
             cfg,
             export_mode,
@@ -799,6 +1131,63 @@ def _engine_path(onnx_path: Path, precision: str, engine_dir: Optional[str]) -> 
     return parent / f"{onnx_path.stem}.{precision}.engine"
 
 
+def _engine_manifest_path(engine_path: Path) -> Path:
+    return engine_path.with_name(f"{engine_path.name}.manifest.json")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_engine_manifest(engine_path: Path, onnx_path: Path, precision: str) -> Path:
+    manifest_path = _engine_manifest_path(engine_path)
+    manifest = {
+        "schema_version": 1,
+        "precision": precision,
+        "onnx_sha256": _sha256_file(onnx_path),
+        "engine_sha256": _sha256_file(engine_path),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return manifest_path
+
+
+def _validate_engine_manifest(engine_path: Path, onnx_path: Path, precision: str) -> Path:
+    manifest_path = _engine_manifest_path(engine_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Can not safely reuse TensorRT engine without its manifest: {manifest_path}. "
+            "Rebuild the engine once without --skip-build."
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid TensorRT engine manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"TensorRT engine manifest must be a JSON object: {manifest_path}")
+
+    expected = {
+        "schema_version": 1,
+        "precision": precision,
+        "onnx_sha256": _sha256_file(onnx_path),
+        "engine_sha256": _sha256_file(engine_path),
+    }
+    if manifest != expected:
+        mismatches = {
+            key: {"got": manifest.get(key), "expected": value}
+            for key, value in expected.items()
+            if manifest.get(key) != value
+        }
+        raise ValueError(
+            f"TensorRT engine manifest does not match the requested ONNX/engine: {mismatches}. "
+            "Rebuild without --skip-build."
+        )
+    return manifest_path
+
+
 def _select_cuda_device(gpu: Optional[int]) -> None:
     if gpu is None:
         current = torch.cuda.current_device()
@@ -818,6 +1207,13 @@ def _select_cuda_device(gpu: Optional[int]) -> None:
 def main(args) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for TensorRT export/evaluation.")
+    _validate_batch_request(
+        args.static_batch,
+        args.min_batch,
+        args.opt_batch,
+        args.max_batch,
+        args.eval_batch_size,
+    )
     _select_cuda_device(args.gpu)
 
     cfg = _build_eval_cfg(args)
@@ -838,23 +1234,52 @@ def main(args) -> None:
             simplify=args.simplify,
             strict_load=args.strict_load,
             export_mode=args.export_mode,
+            input_dtype=args.input_dtype,
         )
     else:
         print(f"Using existing ONNX: {onnx_path}")
 
-    onnx_hw = _read_onnx_image_hw(onnx_path)
-    if onnx_hw is not None and onnx_hw != (img_h, img_w):
-        raise ValueError(
-            f"ONNX images input is {onnx_hw[0]}x{onnx_hw[1]}, but requested/configured "
-            f"resolution is {img_h}x{img_w}. Re-export ONNX or use matching --input-size."
+    onnx_contract = _read_onnx_contract(onnx_path)
+    _validate_onnx_contract(
+        onnx_contract,
+        task=cfg.yaml_cfg["task"],
+        export_mode=args.export_mode,
+        input_dtype=args.input_dtype,
+        image_hw=(img_h, img_w),
+        static_batch=args.static_batch,
+        opt_batch=args.opt_batch,
+    )
+
+    def validate_engine(engine_path: Path) -> Dict[str, object]:
+        engine_contract = _read_engine_contract(engine_path, args.verbose)
+        _validate_engine_contract(
+            engine_contract,
+            onnx_contract,
+            image_hw=(img_h, img_w),
+            static_batch=args.static_batch,
+            min_batch=args.min_batch,
+            opt_batch=args.opt_batch,
+            max_batch=args.max_batch,
         )
+        _validate_engine_top_queries(
+            engine_contract,
+            export_mode=args.export_mode,
+            num_top_queries=_configured_num_top_queries(cfg),
+        )
+        return engine_contract
 
     built_engines: List[Path] = []
     for precision in args.precisions:
         engine_path = _engine_path(onnx_path, precision, args.engine_dir)
         if args.skip_build and engine_path.exists():
+            _validate_engine_manifest(engine_path, onnx_path, precision)
+            engine_contract = validate_engine(engine_path)
             built_engines.append(engine_path)
-            print(f"Using existing {precision.upper()} engine: {engine_path}")
+            print(
+                f"Using existing {precision.upper()} engine with "
+                f"{engine_contract['inputs']['images']} input and matching I/O/profile contract: "
+                f"{engine_path}"
+            )
             continue
 
         try:
@@ -871,6 +1296,9 @@ def main(args) -> None:
                 profiling_verbosity=args.profiling_verbosity,
             )
             if built is not None:
+                validate_engine(built)
+                manifest_path = _write_engine_manifest(built, onnx_path, precision)
+                print(f"Saved TensorRT engine manifest: {manifest_path}")
                 built_engines.append(built)
         except Exception as exc:
             if precision == "fp8" and not args.strict_fp8:
@@ -959,9 +1387,23 @@ def parse_args():
     parser.add_argument("--gpu", type=int, default=None, help="Visible CUDA device index, e.g. --gpu 1.")
     parser.add_argument("--num-top-queries", type=int, default=None, help="Override PostProcessor.num_top_queries.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Filter predictions before COCO eval.")
-    parser.add_argument("--static-batch", action="store_true", help="Export ONNX without dynamic batch axes.")
+    parser.add_argument(
+        "--input-dtype",
+        choices=["float32", "float16"],
+        default="float16",
+        help="ONNX/TensorRT images input contract (default: float16). Use float32 as a compatibility fallback.",
+    )
+    parser.add_argument(
+        "--static-batch",
+        action="store_true",
+        help="Export ONNX without dynamic batch axes; min/opt/max batch values must be equal.",
+    )
     parser.add_argument("--skip-onnx", action="store_true", help="Use existing ONNX if present.")
-    parser.add_argument("--skip-build", action="store_true", help="Use existing engine files if present.")
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Use existing engine files only when their SHA-256 manifests match the ONNX and engine bytes.",
+    )
     parser.add_argument("--no-eval", action="store_true", help="Only export/build, do not evaluate mAP.")
     parser.add_argument("--check", action="store_true", help="Run ONNX checker after export.")
     parser.add_argument(

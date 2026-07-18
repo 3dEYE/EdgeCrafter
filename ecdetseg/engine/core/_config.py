@@ -65,7 +65,8 @@ class BaseConfig(object):
         self.warmup_iter: int = None
         self.flat_epoch: int = None
         
-        self.use_amp :bool = False
+        self.use_amp :bool = True
+        self.input_dtype :str = 'float16'
         self.use_ema :bool = False
         self.ema_decay :float = 0.9999
         self.default_ema_warmups: int = 2000

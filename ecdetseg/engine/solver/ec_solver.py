@@ -53,7 +53,9 @@ class ECSolver(BaseSolver):
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                input_dtype=args.input_dtype,
+                use_amp=args.use_amp,
             )
             for k in test_stats:
                 best_stat['epoch'] = self.last_epoch
@@ -91,7 +93,8 @@ class ECSolver(BaseSolver):
                 ema=self.ema, 
                 scaler=self.scaler, 
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer
+                writer=self.writer,
+                input_dtype=args.input_dtype,
             )
 
             if not self.self_lr_scheduler:  # update by epoch 
@@ -115,7 +118,9 @@ class ECSolver(BaseSolver):
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                input_dtype=args.input_dtype,
+                use_amp=args.use_amp,
             )
 
             for k in test_stats:
@@ -173,7 +178,9 @@ class ECSolver(BaseSolver):
 
         module = self.ema.module if self.ema else self.model
         test_stats, coco_evaluator = evaluate(module, self.criterion, self.postprocessor,
-                self.val_dataloader, self.evaluator, self.device)
+                self.val_dataloader, self.evaluator, self.device,
+                input_dtype=self.cfg.input_dtype,
+                use_amp=self.cfg.use_amp)
 
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval[self.iou_type].eval, self.output_dir / "eval.pth")

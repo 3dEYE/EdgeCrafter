@@ -56,8 +56,9 @@ class PostProcessor(nn.Module):
         
 
         if self.use_focal_loss:
-            scores = F.sigmoid(logits)
-            scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
+            # Sigmoid is monotonic; select logits first to avoid FP16 saturation before TopK.
+            scores, index = torch.topk(logits.flatten(1), self.num_top_queries, dim=-1)
+            scores = torch.sigmoid(scores)
             # labels = index % self.num_classes
             labels = mod(index, self.num_classes)
             index = index // self.num_classes

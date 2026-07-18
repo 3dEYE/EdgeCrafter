@@ -782,7 +782,9 @@ def evaluate_engine(
         stats = coco_evaluator.coco_eval["bbox"].stats.tolist()
         print(
             f"{engine_path.name}: "
-            f"mAP50-95={stats[0]:.4f}, mAP50={stats[1]:.4f}, mAP75={stats[2]:.4f}"
+            f"mAP50-95={stats[0]:.4f}, mAP50={stats[1]:.4f}, mAP75={stats[2]:.4f}; "
+            f"AR1={stats[6]:.4f}, AR10={stats[7]:.4f}, AR100={stats[8]:.4f}; "
+            f"AR-small={stats[9]:.4f}, AR-medium={stats[10]:.4f}, AR-large={stats[11]:.4f}"
         )
         return stats
     return []

@@ -390,8 +390,10 @@ class HybridEncoder(nn.Module):
                 pos_embed = self.build_2d_sincos_position_embedding(
                     self.eval_spatial_size[1] // stride, self.eval_spatial_size[0] // stride,
                     self.hidden_dim, self.pe_temperature)
-                setattr(self, f'pos_embed{idx}', pos_embed)
-                # self.register_buffer(f'pos_embed{idx}', pos_embed)
+                # Keep the cached embedding device/dtype-aware without adding it to
+                # checkpoints. In particular, module.to()/half() must transform it
+                # together with the encoder instead of leaving a hidden FP32 tensor.
+                self.register_buffer(f'pos_embed{idx}', pos_embed, persistent=False)
 
     @staticmethod
     def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.):
@@ -422,9 +424,11 @@ class HybridEncoder(nn.Module):
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
                 if self.training or self.eval_spatial_size is None:
                     pos_embed = self.build_2d_sincos_position_embedding(
-                        w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
+                        w, h, self.hidden_dim, self.pe_temperature).to(
+                            device=src_flatten.device, dtype=src_flatten.dtype)
                 else:
-                    pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
+                    pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(
+                        device=src_flatten.device, dtype=src_flatten.dtype)
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()

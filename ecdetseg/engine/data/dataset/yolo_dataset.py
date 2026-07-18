@@ -93,10 +93,10 @@ class YOLODetection(DetDataset):
         data_cfg = self._load_data_cfg(self.data_file)
 
         data_dir = self.data_file.parent if self.data_file else None
-        cfg_root = None
-        if data_cfg and data_cfg.get("path") is not None:
-            cfg_root = _resolve_path(str(data_cfg["path"]), data_dir)
-        self.root = root_path or cfg_root or data_dir
+        # Treat the explicitly selected dataset directory as authoritative. YOLO
+        # data files are often copied together with a dataset and retain a stale
+        # `path` entry pointing to the source location.
+        self.root = root_path or data_dir
 
         if names is None and data_cfg:
             names = data_cfg.get("names")

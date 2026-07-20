@@ -111,6 +111,7 @@ class MSDeformableAttention(nn.Module):
         num_points=4,
         method='default',
         offset_scale=0.5,
+        reference_point_dim=None,
     ):
         """Multi-Scale Deformable Attention
         """
@@ -119,6 +120,9 @@ class MSDeformableAttention(nn.Module):
         self.num_heads = num_heads
         self.num_levels = num_levels
         self.offset_scale = offset_scale
+        if reference_point_dim is not None and reference_point_dim not in (2, 4):
+            raise ValueError(f"reference_point_dim must be 2 or 4, got {reference_point_dim}.")
+        self.reference_point_dim = reference_point_dim
 
         if isinstance(num_points, list):
             assert len(num_points) == num_levels, ''
@@ -172,8 +176,8 @@ class MSDeformableAttention(nn.Module):
         """
         Args:
             query (Tensor): [bs, query_length, C]
-            reference_points (Tensor): [bs, query_length, n_levels, 2], range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area
+            reference_points (Tensor): [bs, query_length, n_levels, reference_point_dim].
+                Two-dimensional points contain normalized (x, y); four-dimensional points also contain (w, h).
             value (Tensor): [bs, value_length, C]
             value_spatial_shapes (List): [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
 
@@ -188,11 +192,36 @@ class MSDeformableAttention(nn.Module):
         attention_weights = self.attention_weights(query).reshape(bs, Len_q, self.num_heads, sum(self.num_points_list))
         attention_weights = F.softmax(attention_weights, dim=-1)
 
-        if reference_points.shape[-1] == 2:
-            offset_normalizer = torch.tensor(value_spatial_shapes)
-            offset_normalizer = offset_normalizer.flip([1]).reshape(1, 1, 1, self.num_levels, 1, 2)
-            sampling_locations = reference_points.reshape(bs, Len_q, 1, self.num_levels, 1, 2) + sampling_offsets / offset_normalizer
-        elif reference_points.shape[-1] == 4:
+        reference_point_dim = self.reference_point_dim
+        if reference_point_dim is None:
+            # Preserve the original eager API for direct callers. Production
+            # export paths pass the dimension explicitly to avoid tracing a
+            # tensor-shape-dependent Python branch.
+            reference_point_dim = reference_points.shape[-1]
+        elif not torch.jit.is_tracing() and not torch.onnx.is_in_onnx_export():
+            actual_reference_point_dim = reference_points.shape[-1]
+            if actual_reference_point_dim != reference_point_dim:
+                raise ValueError(
+                    "Configured reference_point_dim does not match reference_points: "
+                    f"expected {reference_point_dim}, got {actual_reference_point_dim}."
+                )
+
+        if reference_point_dim == 2:
+            offset_normalizer = query.new_tensor(value_spatial_shapes)
+            offset_normalizer = offset_normalizer.flip([1])
+            expanded_normalizer = torch.cat([
+                offset_normalizer[level:level + 1].expand(num_points, -1)
+                for level, num_points in enumerate(self.num_points_list)
+            ], dim=0)
+            expanded_reference_points = torch.cat([
+                reference_points[:, :, level:level + 1].expand(-1, -1, num_points, -1)
+                for level, num_points in enumerate(self.num_points_list)
+            ], dim=2)
+            sampling_locations = (
+                expanded_reference_points[:, :, None]
+                + sampling_offsets / expanded_normalizer.reshape(1, 1, 1, -1, 2)
+            )
+        elif reference_point_dim == 4:
             # reference_points [8, 480, None, 1,  4]
             # sampling_offsets [8, 480, 8,    12, 2]
             num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
@@ -200,8 +229,9 @@ class MSDeformableAttention(nn.Module):
             sampling_locations = reference_points[:, :, None, :, :2] + offset
         else:
             raise ValueError(
-                "Last dim of reference_points must be 2 or 4, but get {} instead.".
-                format(reference_points.shape[-1]))
+                "Last dim of reference_points must be 2 or 4, "
+                f"but got {reference_point_dim}."
+            )
 
         output = self.ms_deformable_attn_core(value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list)
 
@@ -218,6 +248,7 @@ class TransformerDecoderLayer(nn.Module):
                  n_levels=4,
                  n_points=4,
                  cross_attn_method='default',
+                 reference_point_dim=4,
                  layer_scale=None,
                  ):
         super(TransformerDecoderLayer, self).__init__()
@@ -231,7 +262,14 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
         # cross attention
-        self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points, method=cross_attn_method)
+        self.cross_attn = MSDeformableAttention(
+            d_model,
+            n_head,
+            n_levels,
+            n_points,
+            method=cross_attn_method,
+            reference_point_dim=reference_point_dim,
+        )
         self.dropout2 = nn.Dropout(dropout)
 
         self.gateway = Gate(d_model)
@@ -530,9 +568,10 @@ class ECTransformer(nn.Module):
         self.up = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
         self.reg_scale = nn.Parameter(torch.tensor([reg_scale]), requires_grad=False)
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
-            activation, num_levels, num_points, cross_attn_method=cross_attn_method)
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method, reference_point_dim=4)
         decoder_layer_wide = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
-            activation, num_levels, num_points, cross_attn_method=cross_attn_method, layer_scale=layer_scale)
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method,
+            reference_point_dim=4, layer_scale=layer_scale)
         
         # SegmetationHead
         segmentation_head = SegmentationHead(hidden_dim, num_layers, downsample_ratio=mask_downsample_ratio, image_size=eval_spatial_size) if mask_downsample_ratio else None

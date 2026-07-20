@@ -505,9 +505,13 @@ class ViTAdapter(nn.Module):
         fused_feats = fused_feats.transpose(1, 2).contiguous().view(bs, -1, H_c, W_c)  # [B, D, H, W]
         for i in range(self.num_levels):
             scale = 2 ** (1 - i)
-            resize_H = int(H_c * scale)
-            resize_W = int(W_c * scale)
-            feature = F.interpolate(fused_feats, size=[resize_H, resize_W], mode="bilinear", align_corners=False)
+            feature = F.interpolate(
+                fused_feats,
+                scale_factor=scale,
+                mode="bilinear",
+                align_corners=False,
+                recompute_scale_factor=False,
+            )
             proj_feats.append(feature)
             
         if len(self.projector) == 1:

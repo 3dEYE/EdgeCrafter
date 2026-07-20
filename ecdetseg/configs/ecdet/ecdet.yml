@@ -94,6 +94,7 @@ train_dataloader:
         - {type: Mosaic, output_size: 320, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
            fill_value: 0, max_cached_images: 50, random_pop: True}
         - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: AlbumentationsImageOnly, blur_p: 0.01, median_blur_p: 0.01, to_gray_p: 0.01, clahe_p: 0.01}
         - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
         - {type: SanitizeBoundingBoxes, min_size: 1}

@@ -12,3 +12,4 @@ tabulate
 onnx==1.19.0
 onnxruntime
 opencv-python
+albumentations>=1.4.21

@@ -91,6 +91,7 @@ train_dataloader:
         - {type: RandomZoomOut, p: 0.5}
         - {type: RandomHorizontalFlip}
         - {type: ColorJitter}
+        - {type: AlbumentationsImageOnly, blur_p: 0.01, median_blur_p: 0.01, to_gray_p: 0.01, clahe_p: 0.01}
         - {type: Resize, size: [640, 640]}
         - {type: ToTensor}
         - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]} 

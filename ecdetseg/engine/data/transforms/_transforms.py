@@ -2,9 +2,14 @@
 Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
+import os
 
 from typing import Any, Dict, List, Optional
 
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
+import albumentations as A
+import numpy as np
 import PIL
 import PIL.Image
 import torch
@@ -33,6 +38,32 @@ Normalize = register()(T.Normalize)
 
 
 @register()
+class AlbumentationsImageOnly(T.Transform):
+    """Apply non-spatial Albumentations transforms without modifying targets."""
+
+    _transformed_types = (PIL.Image.Image,)
+
+    def __init__(self, blur_p: float = 0.01, median_blur_p: float = 0.01,
+                 to_gray_p: float = 0.01, clahe_p: float = 0.01) -> None:
+        super().__init__()
+        self.albumentations = A.Compose([
+            A.Blur(p=blur_p),
+            A.MedianBlur(p=median_blur_p),
+            A.ToGray(p=to_gray_p),
+            A.CLAHE(p=clahe_p),
+        ])
+        self._albumentations_seed = None
+
+    def transform(self, inpt: PIL.Image.Image, params: Dict[str, Any]) -> PIL.Image.Image:
+        seed = torch.initial_seed()
+        if seed != self._albumentations_seed:
+            self.albumentations.set_random_seed(seed)
+            self._albumentations_seed = seed
+        augmented = self.albumentations(image=np.asarray(inpt))["image"]
+        return PIL.Image.fromarray(augmented, mode=inpt.mode)
+
+@register()
+
 class EmptyTransform(T.Transform):
     def __init__(self, ) -> None:
         super().__init__()

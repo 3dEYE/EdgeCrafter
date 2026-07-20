@@ -4,7 +4,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 
-from ._transforms import (ConvertBoxes, ConvertPILImage, EmptyTransform,
+from ._transforms import (AlbumentationsImageOnly, ConvertBoxes, ConvertPILImage, EmptyTransform,
                           Normalize, PadToSize, RandomCrop,
                           RandomHorizontalFlip, RandomIoUCrop,
                           RandomPhotometricDistort, RandomZoomOut, Resize,

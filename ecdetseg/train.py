@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import argparse
+import torch.distributed as distributed
 
 from engine.core import YAMLConfig, yaml_utils
 from engine.misc import dist_utils
@@ -81,6 +82,52 @@ def save_run_args(args, cfg) -> None:
     temp_path.replace(args_path)
 
 
+def reserve_output_dir(output_dir: str) -> Path:
+    """Create and return an unused output directory.
+
+    The requested name is used for the first run. Later runs receive the first
+    available ``_vN`` suffix, starting with ``_v2``. Creating the directory
+    with ``exist_ok=False`` also prevents concurrent launches from selecting
+    the same path.
+    """
+    base_path = Path(output_dir)
+    candidate = base_path
+    version = 2
+
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            # A parent component may be a file. In that case changing only the
+            # final directory name cannot help, so preserve the original error
+            # instead of looping forever.
+            if not os.path.lexists(candidate):
+                raise
+            candidate = base_path.with_name(f'{base_path.name}_v{version}')
+            version += 1
+
+
+def configure_output_dir(cfg) -> None:
+    """Reserve a run directory and share its path with all distributed ranks."""
+    requested_path = str(cfg.output_dir)
+    selected_path = None
+
+    if dist_utils.is_main_process():
+        selected_path = str(reserve_output_dir(requested_path))
+
+    if dist_utils.is_dist_available_and_initialized():
+        selected_paths = [selected_path]
+        distributed.broadcast_object_list(selected_paths, src=0)
+        selected_path = selected_paths[0]
+
+    cfg.output_dir = selected_path
+    cfg.yaml_cfg['output_dir'] = selected_path
+
+    if Path(selected_path) != Path(requested_path):
+        print(f'Output directory already exists; using {selected_path}')
+
+
 def main(args, ) -> None:
     """main
     """
@@ -105,6 +152,12 @@ def main(args, ) -> None:
     if args.resume or args.tuning:
         if 'ViTAdapter' in cfg.yaml_cfg:
             cfg.yaml_cfg['ViTAdapter']['skip_load_backbone'] = True
+
+    # Resume training in place because ECSolver may need best.pth from the
+    # existing run at the augmentation-stage boundary. Evaluation is safe to
+    # version even when it loads its weights through --resume.
+    if not args.resume or args.test_only:
+        configure_output_dir(cfg)
 
     print('cfg: ', cfg.__dict__)
 

@@ -221,6 +221,136 @@ class DeployModel(nn.Module):
         return labels.to(torch.int32), boxes, scores
 
 
+def _materialize_reduce_axes_for_tensorrt(model_path: Path) -> int:
+    """Store constant Reduce axes as initializers for TensorRT's ONNX parser."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    onnx_model = onnx.load(str(model_path))
+    producers = {output: node for node in onnx_model.graph.node for output in node.output}
+    constants = {
+        initializer.name: numpy_helper.to_array(initializer)
+        for initializer in onnx_model.graph.initializer
+    }
+
+    def evaluate_constant(name: str):
+        if name in constants:
+            return constants[name]
+        node = producers.get(name)
+        if node is None:
+            raise ValueError(f"ONNX value is not constant: {name}")
+
+        attributes = {attribute.name: attribute for attribute in node.attribute}
+        if node.op_type == "Constant" and "value" in attributes:
+            value = numpy_helper.to_array(attributes["value"].t)
+        elif node.op_type == "Constant" and "value_ints" in attributes:
+            value = np.asarray(attributes["value_ints"].ints, dtype=np.int64)
+        elif node.op_type == "Constant" and "value_int" in attributes:
+            value = np.asarray(attributes["value_int"].i, dtype=np.int64)
+        elif node.op_type == "Reshape":
+            value = np.reshape(
+                evaluate_constant(node.input[0]),
+                evaluate_constant(node.input[1]).astype(np.int64).tolist(),
+            )
+        elif node.op_type == "Cast":
+            dtype = helper.tensor_dtype_to_np_dtype(attributes["to"].i)
+            value = evaluate_constant(node.input[0]).astype(dtype)
+        else:
+            raise ValueError(f"Unsupported constant ONNX op {node.op_type} for value {name}")
+
+        constants[name] = value
+        return value
+
+    materialized = 0
+    for index, node in enumerate(onnx_model.graph.node):
+        if not node.op_type.startswith("Reduce") or len(node.input) < 2 or not node.input[1]:
+            continue
+        axes = np.asarray(evaluate_constant(node.input[1]), dtype=np.int64)
+        initializer_name = f"_trt_reduce_axes_{index}"
+        onnx_model.graph.initializer.append(numpy_helper.from_array(axes, initializer_name))
+        node.input[1] = initializer_name
+        materialized += 1
+
+    if materialized:
+        onnx.save(onnx_model, str(model_path), save_as_external_data=False)
+    return materialized
+
+
+def _restore_optimizer_clip_bounds(model_path: Path, unoptimized_model) -> int:
+    """Restore Clip bounds dropped by the PyTorch 2.9 ONNX optimizer."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    optimized_model = onnx.load(str(model_path))
+    optimized_values = (
+        {value.name for value in optimized_model.graph.input}
+        | {value.name for value in optimized_model.graph.initializer}
+        | {output for node in optimized_model.graph.node for output in node.output}
+    )
+    raw_producers = {
+        output: node
+        for node in unoptimized_model.graph.node
+        for output in node.output
+    }
+    raw_constants = {
+        initializer.name: numpy_helper.to_array(initializer)
+        for initializer in unoptimized_model.graph.initializer
+    }
+
+    def evaluate_raw_constant(name: str):
+        if name in raw_constants:
+            return raw_constants[name]
+        node = raw_producers.get(name)
+        if node is None:
+            raise ValueError(f"Unoptimized ONNX value is not constant: {name}")
+        attributes = {attribute.name: attribute for attribute in node.attribute}
+        if node.op_type == "Constant" and "value" in attributes:
+            value = numpy_helper.to_array(attributes["value"].t)
+        elif node.op_type == "Constant" and "value_ints" in attributes:
+            value = np.asarray(attributes["value_ints"].ints, dtype=np.int64)
+        elif node.op_type == "Constant" and "value_int" in attributes:
+            value = np.asarray(attributes["value_int"].i, dtype=np.int64)
+        elif node.op_type == "Cast":
+            dtype = helper.tensor_dtype_to_np_dtype(attributes["to"].i)
+            value = evaluate_raw_constant(node.input[0]).astype(dtype)
+        else:
+            raise ValueError(f"Unsupported raw constant ONNX op {node.op_type} for value {name}")
+        raw_constants[name] = value
+        return value
+
+    restored = 0
+    for node in optimized_model.graph.node:
+        if node.op_type != "Clip" or len(node.input) < 3:
+            continue
+        missing_min = node.input[1] and node.input[1] not in optimized_values
+        missing_max = node.input[2] and node.input[2] not in optimized_values
+        if not missing_min and not missing_max:
+            continue
+
+        raw_clip = raw_producers.get(node.output[0])
+        if raw_clip is None or raw_clip.op_type != "Min":
+            raise ValueError(f"Can not recover Clip bounds for ONNX value {node.output[0]}")
+        raw_maximum = raw_producers.get(raw_clip.input[0])
+        if raw_maximum is None or raw_maximum.op_type != "Max":
+            raise ValueError(f"Can not recover Clip minimum for ONNX value {node.output[0]}")
+
+        if missing_min:
+            minimum = np.asarray(evaluate_raw_constant(raw_maximum.input[1]))
+            optimized_model.graph.initializer.append(numpy_helper.from_array(minimum, node.input[1]))
+            optimized_values.add(node.input[1])
+        if missing_max:
+            maximum = np.asarray(evaluate_raw_constant(raw_clip.input[1]))
+            optimized_model.graph.initializer.append(numpy_helper.from_array(maximum, node.input[2]))
+            optimized_values.add(node.input[2])
+        restored += 1
+
+    if restored:
+        onnx.save(optimized_model, str(model_path), save_as_external_data=False)
+    return restored
+
+
 def export_onnx(
     cfg: YAMLConfig,
     checkpoint: str,
@@ -233,7 +363,10 @@ def export_onnx(
     strict_load: bool,
     export_mode: str,
     input_dtype: str = "float16",
+    onnx_exporter: str = "legacy",
 ) -> Path:
+    if onnx_exporter not in ("legacy", "dynamo"):
+        raise ValueError(f"Unsupported ONNX exporter: {onnx_exporter}")
     if "ViTAdapter" in cfg.yaml_cfg:
         cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
     _load_checkpoint_model(cfg, checkpoint, strict=strict_load)
@@ -262,28 +395,60 @@ def export_onnx(
             input_names = ["images"]
 
     dynamic_axes = None
+    dynamic_shapes = None
     if not static_batch:
-        dynamic_axes = {"images": {0: "N"}}
-        if "orig_target_sizes" in input_names:
-            dynamic_axes["orig_target_sizes"] = {0: "N"}
-        dynamic_axes.update({name: {0: "N"} for name in output_names})
+        if onnx_exporter == "legacy":
+            dynamic_axes = {"images": {0: "N"}}
+            if "orig_target_sizes" in input_names:
+                dynamic_axes["orig_target_sizes"] = {0: "N"}
+            dynamic_axes.update({name: {0: "N"} for name in output_names})
+        else:
+            dynamic_shapes = {"images": {0: "N"}}
+            if "orig_target_sizes" in input_names:
+                dynamic_shapes["orig_target_sizes"] = {0: "N"}
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    print(f"ONNX exporter: {onnx_exporter}")
     with torch.no_grad():
         _ = model(*input_args)
-        torch.onnx.export(
-            model,
-            input_args,
-            str(output_file),
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            opset_version=opset,
-            verbose=False,
-            do_constant_folding=True,
-            external_data=False,
-            dynamo=False,
-        )
+        if onnx_exporter == "legacy":
+            torch.onnx.export(
+                model,
+                input_args,
+                str(output_file),
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=dynamic_axes,
+                opset_version=opset,
+                verbose=False,
+                do_constant_folding=True,
+                external_data=False,
+                dynamo=False,
+            )
+        else:
+            onnx_program = torch.onnx.export(
+                model,
+                input_args,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_shapes=dynamic_shapes,
+                opset_version=opset,
+                verbose=False,
+                external_data=False,
+                dynamo=True,
+                optimize=False,
+            )
+            unoptimized_model = onnx_program.model_proto
+            onnx_program.optimize()
+            onnx_program.save(str(output_file), external_data=False)
+
+    if onnx_exporter == "dynamo":
+        restored_clips = _restore_optimizer_clip_bounds(output_file, unoptimized_model)
+        if restored_clips:
+            print(f"Restored bounds for {restored_clips} ONNX Clip nodes after optimization.")
+        materialized_axes = _materialize_reduce_axes_for_tensorrt(output_file)
+        if materialized_axes:
+            print(f"Materialized {materialized_axes} constant Reduce axes for TensorRT.")
 
     if check:
         import onnx
@@ -1235,6 +1400,7 @@ def main(args) -> None:
             strict_load=args.strict_load,
             export_mode=args.export_mode,
             input_dtype=args.input_dtype,
+            onnx_exporter=args.onnx_exporter,
         )
     else:
         print(f"Using existing ONNX: {onnx_path}")
@@ -1372,6 +1538,12 @@ def parse_args():
         help="TensorRT profiling verbosity stored in the engine for inspector dumps.",
     )
     parser.add_argument("--opset", type=int, default=20)
+    parser.add_argument(
+        "--onnx-exporter",
+        choices=["legacy", "dynamo"],
+        default="legacy",
+        help="ONNX exporter backend (default: legacy for current TensorRT production compatibility).",
+    )
     parser.add_argument(
         "--input-size",
         nargs="+",

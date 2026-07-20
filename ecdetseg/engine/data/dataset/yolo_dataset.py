@@ -2,6 +2,7 @@
 YOLO-format detection dataset support for EdgeCrafter.
 """
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -77,7 +78,8 @@ class YOLODetection(DetDataset):
         recursive: bool = True,
         normalized: bool = True,
         bbox_to_mask: bool = False,
-        strict: bool = False,
+        strict: bool = True,
+        validate_on_init: bool = True,
         **kwargs,
     ):
         if root is None:
@@ -122,6 +124,7 @@ class YOLODetection(DetDataset):
         self.normalized = normalized
         self.bbox_to_mask = bbox_to_mask
         self.strict = strict
+        self.validate_on_init = validate_on_init
 
         self.names = _normalize_names(names, num_classes)
         self.num_classes = int(num_classes if num_classes is not None else len(self.names))
@@ -133,6 +136,9 @@ class YOLODetection(DetDataset):
 
         if not self.image_files:
             raise FileNotFoundError(f"No images found in {self.img_folder}")
+
+        if self.validate_on_init:
+            self._validate_dataset()
 
     def __len__(self) -> int:
         return len(self.image_files)
@@ -284,7 +290,7 @@ class YOLODetection(DetDataset):
         segments: List[List[List[float]]] = []
 
         if not label_path.exists():
-            return self._empty_targets(height, width)
+            raise FileNotFoundError(f"Missing YOLO label file: {label_path}")
 
         with label_path.open("r", encoding="utf-8") as f:
             for line_number, line in enumerate(f, start=1):
@@ -338,6 +344,37 @@ class YOLODetection(DetDataset):
 
         return boxes_t, labels_t, masks_t, segments
 
+    def _validate_dataset(self) -> None:
+        """Validate every image/label pair before a dataloader starts yielding batches."""
+        for image_path in self.image_files:
+            if self.normalized:
+                width, height = 1, 1
+            else:
+                with Image.open(image_path) as image:
+                    width, height = image.size
+
+            self._validate_label_file(self._label_path(image_path), width, height)
+
+    def _validate_label_file(self, label_path: Path, width: int, height: int) -> None:
+        if not label_path.exists():
+            raise FileNotFoundError(f"Missing YOLO label file: {label_path}")
+
+        with label_path.open("r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                parsed = self._parse_line(line, width, height, label_path, line_number)
+                if parsed is None:
+                    continue
+
+                _, _, polygon = parsed
+                if self.return_masks and polygon is None and not self.bbox_to_mask:
+                    raise ValueError(
+                        f"Invalid label in {label_path}:{line_number}: detection bbox cannot be used as a mask"
+                    )
+
     def _parse_line(
         self,
         line: str,
@@ -351,21 +388,52 @@ class YOLODetection(DetDataset):
             return self._invalid_label(label_path, line_number, "expected at least 5 fields")
 
         try:
-            class_id = int(float(parts[0]))
+            class_value = float(parts[0])
             coords = [float(v) for v in parts[1:]]
         except ValueError:
             return self._invalid_label(label_path, line_number, "contains non-numeric values")
 
+        if not math.isfinite(class_value) or not class_value.is_integer():
+            return self._invalid_label(label_path, line_number, "class id must be a finite integer")
+        if not all(math.isfinite(value) for value in coords):
+            return self._invalid_label(label_path, line_number, "contains non-finite coordinates")
+
+        class_id = int(class_value)
+        if class_id < 0:
+            return self._invalid_label(label_path, line_number, "class id must be non-negative")
+        if self.num_classes > 0 and class_id >= self.num_classes:
+            return self._invalid_label(
+                label_path,
+                line_number,
+                f"class id {class_id} is outside [0, {self.num_classes - 1}]",
+            )
+
+        if self.normalized and any(value < 0.0 or value > 1.0 for value in coords):
+            return self._invalid_label(label_path, line_number, "normalized coordinates must be within [0, 1]")
+
         if len(coords) == 4:
+            if coords[2] <= 0.0 or coords[3] <= 0.0:
+                return self._invalid_label(label_path, line_number, "bbox width and height must be positive")
             box = self._yolo_box_to_xyxy(coords, width, height)
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return self._invalid_label(label_path, line_number, "bbox has no area inside the image")
             return class_id, box, None
 
         if len(coords) >= 6 and len(coords) % 2 == 0:
+            points = set(zip(coords[0::2], coords[1::2]))
+            if len(points) < 3:
+                return self._invalid_label(label_path, line_number, "segmentation polygon needs 3 unique points")
+            if self._polygon_area(coords) <= 0.0:
+                return self._invalid_label(label_path, line_number, "segmentation polygon has no area")
+
             polygon = self._polygon_to_pixels(coords, width, height)
             xs = polygon[0::2]
             ys = polygon[1::2]
             box = [min(xs), min(ys), max(xs), max(ys)]
-            return class_id, self._clip_box(box, width, height), polygon
+            box = self._clip_box(box, width, height)
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return self._invalid_label(label_path, line_number, "segmentation polygon has no area")
+            return class_id, box, polygon
 
         return self._invalid_label(label_path, line_number, "invalid YOLO segmentation polygon")
 
@@ -392,6 +460,15 @@ class YOLODetection(DetDataset):
             px, py = self._scale_xy(x, y, width, height)
             polygon.extend([min(max(px, 0.0), float(width)), min(max(py, 0.0), float(height))])
         return polygon
+
+    @staticmethod
+    def _polygon_area(coords: Sequence[float]) -> float:
+        points = list(zip(coords[0::2], coords[1::2]))
+        area = 0.0
+        for index, (x1, y1) in enumerate(points):
+            x2, y2 = points[(index + 1) % len(points)]
+            area += x1 * y2 - x2 * y1
+        return abs(area) / 2.0
 
     @staticmethod
     def _clip_box(box: Sequence[float], width: int, height: int) -> List[float]:

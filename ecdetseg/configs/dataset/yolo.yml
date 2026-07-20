@@ -17,6 +17,8 @@ train_dataloader:
     type: YOLODetection
     split: train
     return_masks: False
+    strict: True
+    validate_on_init: True
   shuffle: True
   num_workers: 4
   drop_last: True
@@ -30,6 +32,8 @@ val_dataloader:
     type: YOLODetection
     split: val
     return_masks: False
+    strict: True
+    validate_on_init: True
   shuffle: False
   num_workers: 4
   drop_last: False

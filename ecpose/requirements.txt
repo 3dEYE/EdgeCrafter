@@ -3,6 +3,7 @@ ml_dtypes==0.2.0
 numpy==2.0.1
 torchvision
 pycocotools
+faster-coco-eval
 PyYAML
 tensorboard
 scipy==1.16.0

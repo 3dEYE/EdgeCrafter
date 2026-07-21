@@ -7,4 +7,5 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 from .coco_dataset import (CocoDetection, mscoco_category2label,
                            mscoco_category2name, mscoco_label2category)
 from .coco_eval import CocoEvaluator
+from .yolo_pose_dataset import YOLOPoseDetection
 from .coco_utils import get_coco_api_from_dataset

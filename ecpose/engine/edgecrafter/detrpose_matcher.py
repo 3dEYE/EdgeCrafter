@@ -15,12 +15,12 @@
 # ------------------------------------------------------------------------
 
 
-import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 from ..core import register
+from ..misc.keypoint_sigmas import get_keypoint_sigmas
 
 
 @register()
@@ -35,19 +35,7 @@ class DETRPoseHungarianMatcher(nn.Module):
         self.focal_alpha = focal_alpha
         self.num_body_points = num_body_points
         
-        if num_body_points==17:
-            self.sigmas = np.array([
-                .26, .25, .25, .35, .35, .79, .79, .72, .72, .62, .62, 1.07,
-                1.07, .87, .87, .89, .89
-            ], dtype=np.float32) / 10.0
-
-        elif num_body_points==14:
-            self.sigmas = np.array([
-                .79, .79, .72, .72, .62, .62, 1.07, 1.07, .87, .87, .89, .89,
-                .79, .79
-            ]) / 10.0
-        else:
-            raise NotImplementedError
+        self.sigmas = get_keypoint_sigmas(num_body_points)
 
     @torch.no_grad()
     def forward(self, outputs, targets):

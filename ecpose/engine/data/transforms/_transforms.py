@@ -4,6 +4,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 import copy
+import math
 import numbers
 import os
 import random
@@ -123,7 +124,7 @@ def crop(image, target, region):
     return cropped_image, target
 
 
-def hflip(image, target):
+def hflip(image, target, flip_pairs=None):
     flipped_image = F.hflip(image)
 
     w, h = image.size
@@ -135,12 +136,12 @@ def hflip(image, target):
         target["boxes"] = boxes
 
     if "keypoints" in target:
-        flip_pairs = [[1, 2], [3, 4], [5, 6], [7, 8],
-                           [9, 10], [11, 12], [13, 14], [15, 16]]
-        # flip_pairs = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]]
+        if flip_pairs is None:
+            flip_pairs = [[1, 2], [3, 4], [5, 6], [7, 8],
+                          [9, 10], [11, 12], [13, 14], [15, 16]]
         keypoints = target["keypoints"]
         # keypoints[:,:,0] = w - keypoints[:,:, 0]
-        keypoints[:,:,0] = torch.where(keypoints[..., -1]!=0, w - keypoints[:,:, 0]-1, 0)
+        keypoints[:,:,0] = torch.where(keypoints[..., -1]!=0, w - keypoints[:,:, 0], 0)
         for pair in flip_pairs:
             keypoints[:,pair[0], :], keypoints[:,pair[1], :] = keypoints[:,pair[1], :], keypoints[:,pair[0], :].clone()
         target["keypoints"] = keypoints
@@ -259,12 +260,13 @@ class RandomZoomOut(object):
 
 @register()
 class RandomHorizontalFlip(object):
-    def __init__(self, p=0.5):
+    def __init__(self, p=0.5, flip_pairs=None):
         self.p = p
+        self.flip_pairs = flip_pairs
 
     def __call__(self, img, target):
         if random.random() < self.p:
-            return hflip(img, target)
+            return hflip(img, target, self.flip_pairs)
         return img, target        
 
 @register()
@@ -695,7 +697,8 @@ class CopyPaste(object):
         self.copypaste_cache = []
 
     def _extract_patch(self, img, bbox):
-        x1, y1, x2, y2 = map(int, bbox)
+        x1, y1 = math.floor(bbox[0]), math.floor(bbox[1])
+        x2, y2 = math.ceil(bbox[2]), math.ceil(bbox[3])
         return img.crop((x1, y1, x2, y2)), (x1, y1, x2 - x1, y2 - y1)
 
     def _crop_keypoints(self, keypoints, crop_bbox, img_bbox):
@@ -726,7 +729,7 @@ class CopyPaste(object):
         dx, dy = dst_pos
         for kpt in keypoints:
             x, y, v = kpt
-            if v > 0 and sx <= x < sx + sw and sy <= y < sy + sh:
+            if v > 0 and sx <= x <= sx + sw and sy <= y <= sy + sh:
                 new_x = x - sx + dx
                 new_y = y - sy + dy
                 adjusted.append([new_x, new_y, v])
@@ -841,7 +844,7 @@ class CopyPaste(object):
             ])
             augmented_target['area'] = torch.cat([
                 augmented_target['area'],
-                torch.tensor([sw * sh], dtype=torch.float32)
+                torch.tensor([obj['area']], dtype=torch.float32)
             ])
             augmented_target['labels'] = torch.cat([
                 augmented_target['labels'],

@@ -189,4 +189,5 @@ def evaluate(model, postprocessors, coco_evaluator, data_loader, device, writer=
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
     if coco_evaluator is not None:
         stats['coco_eval_keypoints'] = coco_evaluator.coco_eval['keypoints'].stats.tolist()
+        stats.update({key: [value] for key, value in coco_evaluator.plate_summary.items()})
     return stats

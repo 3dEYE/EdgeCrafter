@@ -181,6 +181,9 @@ def convert_to_coco_api(ds):
 
 
 def get_coco_api_from_dataset(dataset):
+    custom_getter = getattr(dataset, "get_coco_api", None)
+    if callable(custom_getter):
+        return custom_getter()
     for _ in range(10):
         if isinstance(dataset, torchvision.datasets.CocoDetection):
             break

@@ -16,21 +16,40 @@ from faster_coco_eval import COCO, COCOeval_faster
 
 from ...core import register
 from ...misc import dist_utils
+from ...misc.keypoint_sigmas import get_keypoint_sigmas
 
 __all__ = ['CocoEvaluator',]
 
 
 @register()
 class CocoEvaluator(object):
-    def __init__(self, coco_gt, iou_types):
+    def __init__(
+        self,
+        coco_gt,
+        iou_types,
+        keypoint_sigmas=None,
+        plate_metrics=False,
+        plate_score_threshold=0.25,
+        plate_iou_threshold=0.5,
+    ):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
         self.coco_gt : COCO = coco_gt
         self.iou_types = iou_types
+        self.keypoint_sigmas = (
+            keypoint_sigmas
+            if keypoint_sigmas is not None
+            else self._infer_keypoint_sigmas(coco_gt)
+        )
+        self.plate_metrics = plate_metrics
+        self.plate_score_threshold = float(plate_score_threshold)
+        self.plate_iou_threshold = float(plate_iou_threshold)
+        self.plate_records = []
+        self.plate_summary = {}
 
         self.coco_eval = {}
         for iou_type in iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = self._create_evaluator(coco_gt, iou_type)
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
@@ -38,14 +57,41 @@ class CocoEvaluator(object):
     def cleanup(self):
         self.coco_eval = {}
         for iou_type in self.iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(self.coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = self._create_evaluator(self.coco_gt, iou_type)
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
+        self.plate_records = []
+        self.plate_summary = {}
+
+    @staticmethod
+    def _infer_keypoint_sigmas(coco_gt):
+        counts = {
+            len(category.get("keypoints", []))
+            for category in coco_gt.dataset.get("categories", [])
+            if category.get("keypoints")
+        }
+        if len(counts) != 1:
+            return None
+        try:
+            return get_keypoint_sigmas(counts.pop())
+        except ValueError:
+            return None
+
+    def _create_evaluator(self, coco_gt, iou_type):
+        evaluator = COCOeval_faster(
+            coco_gt, iouType=iou_type, print_function=print, separate_eval=True
+        )
+        if iou_type == "keypoints" and self.keypoint_sigmas is not None:
+            evaluator.params.kpt_oks_sigmas = np.asarray(self.keypoint_sigmas, dtype=np.float32)
+        return evaluator
 
 
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
+
+        if self.plate_metrics:
+            self._update_plate_metrics(predictions)
 
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
@@ -70,6 +116,14 @@ class CocoEvaluator(object):
             coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
             coco_eval._evalImgs_cpp = eval_imgs
 
+        if self.plate_metrics:
+            gathered_records = dist_utils.all_gather(self.plate_records)
+            records_by_image = {}
+            for records in gathered_records:
+                for record in records:
+                    records_by_image[record["image_id"]] = record
+            self.plate_records = [records_by_image[key] for key in sorted(records_by_image)]
+
     def accumulate(self):
         for coco_eval in self.coco_eval.values():
             coco_eval.accumulate()
@@ -78,6 +132,144 @@ class CocoEvaluator(object):
         for iou_type, coco_eval in self.coco_eval.items():
             print("IoU metric: {}".format(iou_type))
             coco_eval.summarize()
+        if self.plate_metrics:
+            self.plate_summary = self._summarize_plate_metrics()
+            print(
+                "Plate metrics: "
+                f"LP-NME={self.plate_summary['plate_nme']:.6f}, "
+                f"P95={self.plate_summary['plate_nme_p95']:.6f}, "
+                f"precision={self.plate_summary['plate_precision']:.4f}, "
+                f"recall={self.plate_summary['plate_recall']:.4f}, "
+                f"F1={self.plate_summary['plate_f1']:.4f}"
+            )
+
+    @staticmethod
+    def _keypoint_xy(keypoints):
+        values = np.asarray(keypoints, dtype=np.float32).reshape(-1, 3)
+        return values[:, :2], values[:, 2] > 0
+
+    @staticmethod
+    def _keypoint_box(points):
+        return np.asarray(
+            [points[:, 0].min(), points[:, 1].min(), points[:, 0].max(), points[:, 1].max()],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _box_iou(box1, box2):
+        left = max(float(box1[0]), float(box2[0]))
+        top = max(float(box1[1]), float(box2[1]))
+        right = min(float(box1[2]), float(box2[2]))
+        bottom = min(float(box1[3]), float(box2[3]))
+        intersection = max(0.0, right - left) * max(0.0, bottom - top)
+        area1 = max(0.0, float(box1[2] - box1[0])) * max(0.0, float(box1[3] - box1[1]))
+        area2 = max(0.0, float(box2[2] - box2[0])) * max(0.0, float(box2[3] - box2[1]))
+        union = area1 + area2 - intersection
+        return intersection / union if union > 0.0 else 0.0
+
+    def _update_plate_metrics(self, predictions):
+        for image_id, prediction in predictions.items():
+            annotations = self.coco_gt.loadAnns(self.coco_gt.getAnnIds(imgIds=[image_id]))
+            ground_truth = []
+            for annotation in annotations:
+                if annotation.get("iscrowd", 0):
+                    continue
+                points, visible = self._keypoint_xy(annotation["keypoints"])
+                points = points[visible]
+                if len(points) == 0:
+                    continue
+                ground_truth.append(
+                    {
+                        "label": int(annotation["category_id"]),
+                        "points": points,
+                        "box": self._keypoint_box(points),
+                    }
+                )
+
+            scores = prediction["scores"].detach().cpu().numpy()
+            labels = prediction["labels"].detach().cpu().numpy()
+            keypoints = prediction["keypoints"].detach().cpu().numpy()
+            selected = np.flatnonzero(scores >= self.plate_score_threshold)
+            selected = selected[np.argsort(scores[selected])[::-1]]
+
+            unmatched = set(range(len(ground_truth)))
+            nmes = []
+            max_corner_nmes = []
+            for prediction_index in selected:
+                pred_points, pred_visible = self._keypoint_xy(keypoints[prediction_index])
+                pred_points = pred_points[pred_visible]
+                if len(pred_points) == 0:
+                    continue
+                pred_box = self._keypoint_box(pred_points)
+                candidates = [
+                    gt_index
+                    for gt_index in unmatched
+                    if ground_truth[gt_index]["label"] == int(labels[prediction_index])
+                ]
+                if not candidates:
+                    continue
+                ious = [self._box_iou(pred_box, ground_truth[index]["box"]) for index in candidates]
+                best_position = int(np.argmax(ious))
+                if ious[best_position] < self.plate_iou_threshold:
+                    continue
+
+                gt_index = candidates[best_position]
+                gt_points = ground_truth[gt_index]["points"]
+                if pred_points.shape != gt_points.shape:
+                    continue
+                gt_box = ground_truth[gt_index]["box"]
+                diagonal = float(np.hypot(gt_box[2] - gt_box[0], gt_box[3] - gt_box[1]))
+                if diagonal <= 0.0:
+                    continue
+                corner_errors = np.linalg.norm(pred_points - gt_points, axis=1) / diagonal
+                nmes.append(float(corner_errors.mean()))
+                max_corner_nmes.append(float(corner_errors.max()))
+                unmatched.remove(gt_index)
+
+            self.plate_records.append(
+                {
+                    "image_id": int(image_id),
+                    "ground_truth": len(ground_truth),
+                    "predictions": len(selected),
+                    "nmes": nmes,
+                    "max_corner_nmes": max_corner_nmes,
+                }
+            )
+
+    def _summarize_plate_metrics(self):
+        ground_truth = sum(record["ground_truth"] for record in self.plate_records)
+        predictions = sum(record["predictions"] for record in self.plate_records)
+        nmes = np.asarray(
+            [value for record in self.plate_records for value in record["nmes"]],
+            dtype=np.float64,
+        )
+        max_corner_nmes = np.asarray(
+            [value for record in self.plate_records for value in record["max_corner_nmes"]],
+            dtype=np.float64,
+        )
+        matches = int(nmes.size)
+        precision = matches / predictions if predictions else 0.0
+        recall = matches / ground_truth if ground_truth else 0.0
+        f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+        def aggregate(values, operation):
+            return float(operation(values)) if values.size else float("nan")
+
+        return {
+            "plate_nme": aggregate(nmes, np.mean),
+            "plate_nme_median": aggregate(nmes, np.median),
+            "plate_nme_p95": aggregate(nmes, lambda values: np.percentile(values, 95)),
+            "plate_max_corner_nme": aggregate(max_corner_nmes, np.mean),
+            "plate_max_corner_nme_p95": aggregate(
+                max_corner_nmes, lambda values: np.percentile(values, 95)
+            ),
+            "plate_precision": float(precision),
+            "plate_recall": float(recall),
+            "plate_f1": float(f1),
+            "plate_matches": float(matches),
+            "plate_ground_truth": float(ground_truth),
+            "plate_predictions": float(predictions),
+        }
 
     def prepare(self, predictions, iou_type):
         if iou_type == "bbox":

@@ -1,0 +1,53 @@
+task: pose
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['keypoints']
+  plate_metrics: True
+  plate_score_threshold: 0.25
+  plate_iou_threshold: 0.5
+
+num_classes: 1
+remap_mscoco_category: False
+yolo_root: ~
+yolo_data_file: ~
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: YOLOPoseDetection
+    split: train
+    num_keypoints: 4
+    normalized: True
+    strict: True
+    validate_on_init: True
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 4
+  total_batch_size: 16
+  drop_last: True
+  pin_memory: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: YOLOPoseDetection
+    split: val
+    num_keypoints: 4
+    normalized: True
+    strict: True
+    validate_on_init: True
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 4
+  total_batch_size: 16
+  drop_last: False
+  pin_memory: True
+  collate_fn:
+    type: BatchImageCollateFunction

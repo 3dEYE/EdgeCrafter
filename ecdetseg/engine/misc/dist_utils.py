@@ -154,13 +154,25 @@ def de_model(model):
 def warp_loader(loader, shuffle=False):
     if is_dist_available_and_initialized():
         sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
-        loader = DataLoader(loader.dataset,
-                            loader.batch_size,
-                            sampler=sampler,
-                            drop_last=loader.drop_last,
-                            collate_fn=loader.collate_fn,
-                            pin_memory=loader.pin_memory,
-                            num_workers=loader.num_workers)
+        loader_kwargs = dict(
+            dataset=loader.dataset,
+            batch_size=loader.batch_size,
+            sampler=sampler,
+            drop_last=loader.drop_last,
+            collate_fn=loader.collate_fn,
+            pin_memory=loader.pin_memory,
+            num_workers=loader.num_workers,
+            timeout=loader.timeout,
+            worker_init_fn=loader.worker_init_fn,
+            multiprocessing_context=loader.multiprocessing_context,
+            generator=loader.generator,
+            persistent_workers=loader.persistent_workers,
+            pin_memory_device=loader.pin_memory_device,
+            in_order=loader.in_order,
+        )
+        if loader.num_workers > 0:
+            loader_kwargs['prefetch_factor'] = loader.prefetch_factor
+        loader = DataLoader(**loader_kwargs)
     return loader
 
 

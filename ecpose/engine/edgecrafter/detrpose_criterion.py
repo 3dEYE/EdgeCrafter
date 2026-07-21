@@ -426,15 +426,16 @@ class DETRPoseCriterion(nn.Module):
             single_pad, scalar = self.prep_for_dn(dn_meta)
             dn_pos_idx = []
             dn_neg_idx = []
+            device = outputs["pred_logits"].device
             for i in range(len(targets)):
                 if len(targets[i]['labels']) > 0:
-                    t = torch.arange(len(targets[i]['labels'])).long().cuda()
+                    t = torch.arange(len(targets[i]['labels']), device=device).long()
                     t = t.unsqueeze(0).repeat(scalar, 1)
                     tgt_idx = t.flatten()
-                    output_idx = (torch.tensor(range(scalar)) * single_pad).long().cuda().unsqueeze(1) + t
+                    output_idx = (torch.arange(scalar, device=device) * single_pad).long().unsqueeze(1) + t
                     output_idx = output_idx.flatten()
                 else:
-                    output_idx = tgt_idx = torch.tensor([]).long().cuda()
+                    output_idx = tgt_idx = torch.empty(0, dtype=torch.long, device=device)
 
                 dn_pos_idx.append((output_idx, tgt_idx))
                 dn_neg_idx.append((output_idx + single_pad // 2, tgt_idx))

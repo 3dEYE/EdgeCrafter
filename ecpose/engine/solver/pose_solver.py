@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import math
 import time
 
 import torch
@@ -23,6 +24,24 @@ def safe_get_rank():
         return torch.distributed.get_rank()
     else:
         return 0
+
+
+def _metric_value(evaluation_stats, metric_name):
+    if metric_name not in evaluation_stats:
+        available = ", ".join(sorted(evaluation_stats))
+        raise KeyError(f"Primary metric {metric_name!r} is missing; available metrics: {available}")
+    value = evaluation_stats[metric_name]
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(f"Primary metric {metric_name!r} is empty")
+        value = value[0]
+    return float(value)
+
+
+def _is_better(value, best_value, mode):
+    if not math.isfinite(value):
+        return False
+    return value < best_value if mode == "min" else value > best_value
 
 class PoseSolver(BaseSolver):
     def train(self,):
@@ -83,8 +102,15 @@ class PoseSolver(BaseSolver):
         print("-" * 42 + "Start training" + "-" * 43)
         
         
-        top1 = 0
-        best_stat = {'epoch': -1, }
+        primary_metric = getattr(args, "primary_metric", "coco_eval_keypoints")
+        primary_metric_mode = getattr(args, "primary_metric_mode", "max").lower()
+        if primary_metric_mode not in {"min", "max"}:
+            raise ValueError("primary_metric_mode must be 'min' or 'max'")
+        initial_best = math.inf if primary_metric_mode == "min" else -math.inf
+        stage_best = {1: initial_best, 2: initial_best}
+        global_best = initial_best
+        global_best_epoch = -1
+        stop_epoch = self.train_dataloader.collate_fn.stop_epoch
         # evaluate again before resume training
         if self.last_epoch > 0:
             module = self.ema.module if self.ema else self.model
@@ -95,13 +121,15 @@ class PoseSolver(BaseSolver):
                 self.val_dataloader,
                 self.device
             )
-            for k in test_stats:
-                best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
-                print(f'best_stat: {best_stat}')
+            resumed_value = _metric_value(test_stats, primary_metric)
+            if math.isfinite(resumed_value):
+                resumed_stage = 1 if self.last_epoch < stop_epoch else 2
+                stage_best[resumed_stage] = resumed_value
+                global_best = resumed_value
+                global_best_epoch = self.last_epoch
+            resume_stat = {'epoch': global_best_epoch, primary_metric: global_best}
+            print(f'best_stat: {resume_stat}')
 
-        best_stat_print = best_stat.copy()
         start_time = time.time()
         start_epoch = self.last_epoch + 1
         for epoch in range(start_epoch, args.epoches):
@@ -184,40 +212,24 @@ class PoseSolver(BaseSolver):
                             self.writer.add_scalar(f'Test/regular_{k}_{i}'.format(k), v, epoch)
                 eval_stats = test_stats
             
-            for k in eval_stats:
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if eval_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], eval_stats[k][0])
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = eval_stats[k][0]
+            current_value = _metric_value(eval_stats, primary_metric)
+            stage = 1 if epoch < stop_epoch else 2
+            improved = _is_better(current_value, stage_best[stage], primary_metric_mode)
+            if improved:
+                stage_best[stage] = current_value
+                if self.output_dir:
+                    dist_utils.save_on_master(
+                        self.state_dict(), self.output_dir / f'best_stg{stage}.pth'
+                    )
+            elif stage == 2 and self.ema is not None:
+                self.ema.decay -= 0.0001
+                print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
-                if best_stat[k] > top1:
-                    best_stat_print['epoch'] = epoch
-                    top1 = best_stat[k]
-                    if self.output_dir:
-                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                        else:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
-
-                best_stat_print[k] = max(best_stat[k], top1)
-                print(f'best_stat: {best_stat_print}')  # global best
-
-                if best_stat['epoch'] == epoch and self.output_dir:
-                    if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if eval_stats[k][0] > top1:
-                            top1 = eval_stats[k][0]
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                    else:
-                        top1 = max(eval_stats[k][0], top1)
-                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
-
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    best_stat = {'epoch': -1, }
-                    self.ema.decay -= 0.0001
-                    # self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
-                    print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
+            if _is_better(current_value, global_best, primary_metric_mode):
+                global_best = current_value
+                global_best_epoch = epoch
+            best_stat_print = {'epoch': global_best_epoch, primary_metric: global_best}
+            print(f'best_stat: {best_stat_print}')
 
 
             log_stats = {

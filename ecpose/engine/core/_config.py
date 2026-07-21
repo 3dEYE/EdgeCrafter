@@ -75,6 +75,8 @@ class BaseConfig(object):
         self.seed :int = None
         self.print_freq :int = None
         self.checkpoint_freq :int = 1
+        self.primary_metric :str = 'coco_eval_keypoints'
+        self.primary_metric_mode :str = 'max'
         self.output_dir :str = None
         self.summary_dir :str = None
         self.device : str = ''

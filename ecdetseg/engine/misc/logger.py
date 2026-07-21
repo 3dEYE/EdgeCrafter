@@ -5,6 +5,7 @@ Mostly copy-paste from torchvision references.
 """
 
 import datetime
+import math
 import pickle
 import time
 from collections import defaultdict, deque
@@ -191,6 +192,8 @@ class MetricLogger(object):
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
+        data_times = []
+        processed_samples = 0
         space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
         if torch.cuda.is_available():
             log_msg = self.delimiter.join([
@@ -200,6 +203,7 @@ class MetricLogger(object):
                 '{meters}',
                 'time: {time}',
                 'data: {data}',
+                'data load: {data_ratio:.0%}',
                 'max mem: {memory:.0f}'
             ])
         else:
@@ -209,30 +213,47 @@ class MetricLogger(object):
                 'eta: {eta}',
                 '{meters}',
                 'time: {time}',
-                'data: {data}'
+                'data: {data}',
+                'data load: {data_ratio:.0%}'
             ])
         MB = 1024.0 * 1024.0
         for obj in iterable:
-            data_time.update(time.time() - end)
+            current_data_time = time.time() - end
+            data_time.update(current_data_time)
+            data_times.append(current_data_time)
+            if isinstance(obj, (tuple, list)) and obj and isinstance(obj[0], torch.Tensor):
+                processed_samples += int(obj[0].shape[0])
             yield obj
             iter_time.update(time.time() - end)
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                data_ratio = data_time.total / max(iter_time.total, 1e-12)
                 if torch.cuda.is_available():
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
-                        time=str(iter_time), data=str(data_time),
+                        time=str(iter_time), data=str(data_time), data_ratio=data_ratio,
                         memory=torch.cuda.max_memory_allocated() / MB))
                 else:
                     print(log_msg.format(
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
+                        time=str(iter_time), data=str(data_time), data_ratio=data_ratio))
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
+        if data_times:
+            p95_index = min(len(data_times) - 1, math.ceil(0.95 * len(data_times)) - 1)
+            data_p95 = sorted(data_times)[p95_index]
+            data_ratio = data_time.total / max(iter_time.total, 1e-12)
+            samples_per_second = processed_samples / max(total_time, 1e-12)
+            print(
+                '{} Input pipeline: data avg {:.4f}s, p95 {:.4f}s, '
+                'data load {:.1%}, local throughput {:.2f} samples/s'.format(
+                    header, data_time.global_avg, data_p95, data_ratio, samples_per_second
+                )
+            )

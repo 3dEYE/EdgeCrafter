@@ -175,7 +175,21 @@ class YAMLConfig(BaseConfig):
         if 'total_batch_size' in global_cfg[name]:
             # pop unexpected key for dataloader init
             _ = global_cfg[name].pop('total_batch_size')
-        loader = create(name, global_cfg, batch_size=bs)
+        # Runtime policy belongs to the loader builder rather than dataset
+        # descriptions. Explicit command-line/config overrides still win.
+        runtime_defaults = {
+            'num_workers': 'auto',
+            'max_workers': None if name == 'train_dataloader' else 4,
+            'pin_memory': True,
+            'persistent_workers': True,
+            'prefetch_factor': 1,
+        }
+        loader_cfg = global_cfg[name]
+        runtime_kwargs = {
+            key: loader_cfg.get(key, value)
+            for key, value in runtime_defaults.items()
+        }
+        loader = create(name, global_cfg, batch_size=bs, **runtime_kwargs)
         loader.shuffle = self.yaml_cfg[name].get('shuffle', False)
         return loader
 

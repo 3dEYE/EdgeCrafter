@@ -20,7 +20,6 @@ train_dataloader:
     strict: True
     validate_on_init: True
   shuffle: True
-  num_workers: 4
   drop_last: True
   collate_fn:
     type: BatchImageCollateFunction
@@ -35,7 +34,6 @@ val_dataloader:
     strict: True
     validate_on_init: True
   shuffle: False
-  num_workers: 4
   drop_last: False
   collate_fn:
     type: BatchImageCollateFunction

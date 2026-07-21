@@ -123,7 +123,6 @@ train_dataloader:
 
   shuffle: True
   total_batch_size: 32 # total batch size equals to 32 (4 * 8)
-  num_workers: 4
 
 
 val_dataloader:
@@ -136,7 +135,6 @@ val_dataloader:
       policy: default
   shuffle: False
   total_batch_size: 64
-  num_workers: 4
 
 
 
@@ -190,4 +188,4 @@ epochs: 62 # 5x (1x for 12 epochs) + 2(no_aug_epoch)
 lrsheduler: flatcosine
 lr_gamma: 0.5
 warmup_iter: 2000
-flat_epoch: ~    
+flat_epoch: ~

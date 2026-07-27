@@ -195,12 +195,56 @@ class YAMLConfig(BaseConfig):
 
     @staticmethod
     def resolve_yolo_num_classes(cfg: dict):
+        yolo_root_value = cfg.get('yolo_root', None)
+        yolo_root = None
+        if yolo_root_value is not None:
+            if not isinstance(yolo_root_value, (str, Path)):
+                raise TypeError(
+                    'yolo_root must be a filesystem path, '
+                    f'got {type(yolo_root_value).__name__}'
+                )
+
+            yolo_root_text = str(yolo_root_value).strip()
+            if not yolo_root_text:
+                raise ValueError('yolo_root must not be empty')
+            if yolo_root_text.startswith('='):
+                raise ValueError(
+                    f"Invalid yolo_root={yolo_root_value!r}: the path starts with '='. "
+                    "When overriding it from the command line, use "
+                    "`yolo_root=/path/to/dataset` with a single '='."
+                )
+
+            yolo_root = Path(yolo_root_text).expanduser()
+            if not yolo_root.exists():
+                raise FileNotFoundError(
+                    f"YOLO dataset root does not exist: {yolo_root} "
+                    f"(from yolo_root={yolo_root_value!r}). "
+                    'Check the path and make sure the dataset is mounted.'
+                )
+            if not yolo_root.is_dir():
+                raise NotADirectoryError(
+                    f"YOLO dataset root is not a directory: {yolo_root} "
+                    f"(from yolo_root={yolo_root_value!r})"
+                )
+
+        data_file = cfg.get('yolo_data_file', None)
+        if data_file is not None:
+            data_path = Path(data_file).expanduser()
+            if not data_path.exists():
+                raise FileNotFoundError(
+                    f'YOLO data file does not exist: {data_path} '
+                    f'(from yolo_data_file={data_file!r})'
+                )
+            if not data_path.is_file():
+                raise IsADirectoryError(
+                    f'YOLO data file is not a file: {data_path} '
+                    f'(from yolo_data_file={data_file!r})'
+                )
+
         if cfg.get('num_classes', None) is not None:
             return
 
-        data_file = cfg.get('yolo_data_file', None)
-        if data_file is None and cfg.get('yolo_root', None) is not None:
-            yolo_root = Path(cfg['yolo_root']).expanduser()
+        if data_file is None and yolo_root is not None:
             for name in ('data.yaml', 'data.yml', 'data_win.yaml', 'dataset.yaml', 'dataset.yml'):
                 candidate = yolo_root / name
                 if candidate.exists():
@@ -217,9 +261,23 @@ class YAMLConfig(BaseConfig):
                         break
 
         if data_file is None:
+            if yolo_root is not None:
+                raise FileNotFoundError(
+                    f'Could not infer num_classes for the YOLO dataset at {yolo_root}: '
+                    'no data.yaml, data.yml, data_win.yaml, dataset.yaml, or dataset.yml '
+                    'was found. Add one of these files, pass '
+                    '`yolo_data_file=/path/to/data.yaml`, or set `num_classes` explicitly.'
+                )
             return
 
         data_path = Path(data_file).expanduser()
+        # Dataset-level data_file entries and files discovered under yolo_root
+        # reach this branch after the explicit global yolo_data_file check above.
+        if not data_path.exists():
+            raise FileNotFoundError(f'YOLO data file does not exist: {data_path}')
+        if not data_path.is_file():
+            raise IsADirectoryError(f'YOLO data file is not a file: {data_path}')
+
         with data_path.open('r', encoding='utf-8') as f:
             data_cfg = yaml.safe_load(f) or {}
 

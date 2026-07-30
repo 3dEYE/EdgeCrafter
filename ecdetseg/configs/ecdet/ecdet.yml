@@ -183,7 +183,7 @@ optimizer:
 
 
 ## LR-Scheduler
-epochs: 62 # 5x (1x for 12 epochs) + 2(no_aug_epoch)
+epochs: 100
 
 lrsheduler: flatcosine
 lr_gamma: 0.5

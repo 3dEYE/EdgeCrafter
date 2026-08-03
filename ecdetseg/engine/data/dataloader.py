@@ -238,8 +238,11 @@ class BaseCollateFunction(object):
 
 @register() 
 class BatchImageCollateFunction(BaseCollateFunction):
+    #: Target entries with one row per object, merged when two samples are mixed.
+    per_object_keys = ('boxes', 'labels', 'area', 'iscrowd', 'masks')
+
     def __init__(
-        self, 
+        self,
         mixup_prob=0.0,
         mixup_epoch=0,
     ) -> None:
@@ -257,7 +260,6 @@ class BatchImageCollateFunction(BaseCollateFunction):
         Returns:
             tuple: Updated images and targets
         """
-        beta = round(random.uniform(0.45, 0.55), 6)
         # Apply Mixup if within specified epoch range and probability threshold
         if random.random() < self.mixup_prob and self.epoch < self.mixup_epoch:
             # Generate mixup ratio
@@ -271,18 +273,13 @@ class BatchImageCollateFunction(BaseCollateFunction):
             updated_targets = deepcopy(targets)
 
             for i in range(len(targets)):
-                # Combine boxes, labels, and areas from original and shifted targets
-                updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
-                updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
-                updated_targets[i]['area'] = torch.cat([targets[i]['area'], shifted_targets[i]['area']], dim=0)
-                if 'masks' in targets[i]:
-                    updated_targets[i]['masks'] = torch.cat([targets[i]['masks'], shifted_targets[i]['masks']], dim=0)
-
-                # Add mixup ratio to targets
-                updated_targets[i]['mixup'] = torch.tensor(
-                    [beta] * len(targets[i]['labels']) + [1.0 - beta] * len(shifted_targets[i]['labels']), 
-                    dtype=torch.float32
-                    )
+                # Merge every per-object entry from the original and the shifted
+                # target. Skipping one of them leaves it out of sync with `boxes`.
+                for key in self.per_object_keys:
+                    if key in targets[i] and key in shifted_targets[i]:
+                        updated_targets[i][key] = torch.cat(
+                            [targets[i][key], shifted_targets[i][key]], dim=0
+                        )
             targets = updated_targets
             
         return images, targets

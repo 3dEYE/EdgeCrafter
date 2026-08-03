@@ -445,7 +445,7 @@ class ViTAdapter(nn.Module):
         if weights_path is None:
             print(
                 "="*80 + "\n",
-                "❌❌❌ WARNING: Pretrained ViT weights not loaded! ❌❌❌\n"
+                "WARNING: Pretrained ViT weights not loaded!\n"
                 "The model is running with randomly initialized parameters.\n"
                 "This will severely degrade performance and convergence!\n"
                 f"Please download the model manually from {url}.\n"
@@ -461,8 +461,8 @@ class ViTAdapter(nn.Module):
             self.backbone.load_state_dict(state, strict=True)
             print(
                 "=" * 80 + "\n",
-                "✅ Pretrained ViT weights loaded successfully!\n"
-                f"📦 Weights file: {path}\n",
+                "Pretrained ViT weights loaded successfully!\n"
+                f"Weights file: {path}\n",
                 "=" * 80
             )
         else:
@@ -484,8 +484,8 @@ class ViTAdapter(nn.Module):
             self.backbone.load_state_dict(state, strict=True)
             print(
                 "=" * 80 + "\n",
-                "✅ Pretrained ViT weights loaded successfully!\n"
-                f"📦 Weights downloaded to: {model_dir}\n",
+                "Pretrained ViT weights loaded successfully!\n"
+                f"Weights downloaded to: {model_dir}\n",
                 "=" * 80,
                 sep="")
 

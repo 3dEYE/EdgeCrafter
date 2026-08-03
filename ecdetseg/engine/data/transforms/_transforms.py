@@ -6,9 +6,6 @@ import os
 
 from typing import Any, Dict, List, Optional
 
-os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-
-import albumentations as A
 import numpy as np
 import PIL
 import PIL.Image
@@ -19,7 +16,8 @@ import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as F
 
 from ...core import register
-from .._misc import (BoundingBoxes, Image, Mask, SanitizeBoundingBoxes, Video,
+from .._misc import (BoundingBoxes, Image, Mask,
+                     SanitizeBoundingBoxes as _SanitizeBoundingBoxes, Video,
                      _boxes_keys, convert_to_tv_tensor)
 
 torchvision.disable_beta_transforms_warning()
@@ -32,9 +30,47 @@ Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
 # PILToTensor = register()(T.PILToTensor)
-SanitizeBoundingBoxes = register(name='SanitizeBoundingBoxes')(SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
+
+
+def _import_albumentations():
+    """Import albumentations lazily so it stays optional for other pipelines."""
+    os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+    try:
+        import albumentations
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "AlbumentationsImageOnly requires the `albumentations` package: "
+            "pip install 'albumentations>=1.4.21'"
+        ) from exc
+    return albumentations
+
+
+def _per_object_tensors(inputs):
+    """Return the per-object target tensors that must follow the boxes."""
+    target = inputs[1] if isinstance(inputs, (tuple, list)) and len(inputs) > 1 else inputs
+    if not isinstance(target, dict) or 'labels' not in target:
+        return None
+    num_objects = len(target['labels'])
+    return [
+        target[key]
+        for key in ('labels', 'area', 'iscrowd')
+        if key in target and torch.is_tensor(target[key]) and len(target[key]) == num_objects
+    ]
+
+
+@register(name='SanitizeBoundingBoxes')
+class SanitizeBoundingBoxes(_SanitizeBoundingBoxes):
+    """Drop degenerate boxes together with every aligned per-object tensor.
+
+    The default ``labels_getter`` only finds ``labels``, which leaves ``area`` and
+    ``iscrowd`` at their pre-filter length once Mosaic or RandomIoUCrop has
+    removed boxes.
+    """
+
+    def __init__(self, *args, labels_getter=_per_object_tensors, **kwargs) -> None:
+        super().__init__(*args, labels_getter=labels_getter, **kwargs)
 
 
 @register()
@@ -46,6 +82,7 @@ class AlbumentationsImageOnly(T.Transform):
     def __init__(self, blur_p: float = 0.01, median_blur_p: float = 0.01,
                  to_gray_p: float = 0.01, clahe_p: float = 0.01) -> None:
         super().__init__()
+        A = _import_albumentations()
         self.albumentations = A.Compose([
             A.Blur(p=blur_p),
             A.MedianBlur(p=median_blur_p),

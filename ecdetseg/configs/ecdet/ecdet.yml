@@ -108,9 +108,12 @@ train_dataloader:
       policy: stop_epoch  # close augmention at certain epoch
 
       # Mosaic options
-      mosaic_epoch: 36
+      # Mosaic/mixup run over ~48% of the schedule and the last 2 epochs stay
+      # clean. `stop_epoch` must remain within 5 epochs of `epochs`, otherwise
+      # YAMLConfig.reset_cfg overrides it with `epochs - 2` and warns.
+      mosaic_epoch: 48
       mosaic_prob: 0.5
-      stop_epoch: 60
+      stop_epoch: 98
 
       # remove strong augmentations after at no_aug_epoch 
       remove_ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop', ]
@@ -119,7 +122,7 @@ train_dataloader:
     type: BatchImageCollateFunction
     # Mixup options
     mixup_prob: 0.5
-    mixup_epoch: 36
+    mixup_epoch: 48
 
   shuffle: True
   total_batch_size: 32 # total batch size equals to 32 (4 * 8)
@@ -186,6 +189,6 @@ optimizer:
 epochs: 100
 
 lrsheduler: flatcosine
-lr_gamma: 0.5
+lr_gamma: 0.1   # final LR = lr_gamma * lr; 0.5 barely anneals over 100 epochs
 warmup_iter: 2000
-flat_epoch: ~
+flat_epoch: ~   # defaults to mosaic_epoch

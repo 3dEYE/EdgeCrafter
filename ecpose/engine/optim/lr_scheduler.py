@@ -24,7 +24,7 @@ def flat_cosine_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, curren
         float: Calculated learning rate.
     """
     if current_iter <= warmup_iter:
-        return init_lr * (current_iter / float(warmup_iter)) ** 2
+        return init_lr * (current_iter / float(warmup_iter)) ** 2 if warmup_iter > 0 else init_lr
     elif warmup_iter < current_iter <= flat_iter:
         return init_lr
     elif current_iter >= total_iter - no_aug_iter:

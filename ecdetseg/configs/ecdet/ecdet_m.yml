@@ -54,20 +54,23 @@ optimizer:
 
 epochs: 100
 warmup_iter: 2000
-lr_gamma: 0.5
+lr_gamma: 0.1   # final LR = lr_gamma * lr; 0.5 barely anneals over 100 epochs
 
 eval_spatial_size: [640, 640] # h w
 
 
 train_dataloader:
-  dataset: 
+  dataset:
     transforms:
-      mosaic_epoch: 30
+      # Keep mosaic/mixup over ~48% of the run and leave 2 clean epochs at the
+      # end, matching the ratios of the 50/74-epoch recipes. `stop_epoch` must
+      # stay within 5 epochs of `epochs` or YAMLConfig.reset_cfg overrides it.
+      mosaic_epoch: 48
       mosaic_prob: 0.75
-      stop_epoch: 60
+      stop_epoch: 98
 
   collate_fn:
-    mixup_prob: 0.75
-    mixup_epoch: 30
+    mixup_prob: 0.5
+    mixup_epoch: 48
 
 

@@ -4,7 +4,10 @@ __include__: [
 ]
 
 output_dir: outputs/ecpose_m_plate
-primary_metric: plate_nme
+# Plain `plate_nme` only averages over plates that were matched, so a model that
+# finds one easy plate scores best. The penalised variant charges every missed
+# ground-truth plate a full-diagonal error, which keeps recall in the selection.
+primary_metric: plate_nme_penalized
 primary_metric_mode: min
 
 ViTAdapter:
@@ -38,6 +41,15 @@ DETRPosePostProcessor:
 
 eval_spatial_size: [640, 640]
 epoches: 92
+
+# The inherited MultiStepLR has its only milestone at epoch 5000, i.e. the LR
+# never decays. Use the flat-cosine schedule instead: flat while mosaic/mixup are
+# on, cosine down to lr_gamma * lr, then constant for the stage-2 fine-tune.
+lrsheduler: flatcosine
+lr_gamma: 0.1
+warmup_iter: 2000
+flat_epoch: 45      # == policy.epoch[1], where mosaic stops
+no_aug_epoch: 2     # == epoches - collate_fn.stop_epoch
 
 optimizer:
   type: AdamW
@@ -73,6 +85,9 @@ train_dataloader:
       mosaic_prob: 0.5
       policy:
         epoch: [4, 45, 90]
+        # Must match the op class names above: this config swaps MixUpCopyPaste
+        # for plain MixUp, and an unlisted op is never switched off.
+        ops: ['PoseMosaic', 'MixUp', 'RandomZoomOut']
   collate_fn:
     stop_epoch: 90
 

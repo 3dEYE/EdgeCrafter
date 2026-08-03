@@ -24,6 +24,10 @@ class Mosaic(T.Transform):
     into a single composite image with randomized transformations.
     """
 
+    # Keys describing the sample as a whole rather than its objects. Concatenating
+    # them would leave one mosaic sample with four ids and four size pairs.
+    IMAGE_LEVEL_KEYS = ('image_id', 'idx', 'orig_size', 'size')
+
     def __init__(self, output_size=320, max_size=None, rotation_range=0, translation_range=(0.1, 0.1),
                  scaling_range=(0.5, 1.5), fill_value=114, max_cached_images=50,
                  random_pop=True) -> None:
@@ -100,10 +104,23 @@ class Mosaic(T.Transform):
 
             mosaic_target.append(target)
 
-        # Merge targets (boxes, labels, etc.)
+        # Merge per-object targets (boxes, labels, area, iscrowd, ...)
         merged_target = {}
         for key in mosaic_target[0]:
+            if key in self.IMAGE_LEVEL_KEYS:
+                continue
             merged_target[key] = torch.cat([target[key] for target in mosaic_target])
+
+        # The mosaic is one new sample: keep the base sample's identity and report
+        # the canvas it now occupies. `orig_size` is (w, h) and `size` is (h, w).
+        canvas_width, canvas_height = max_width * 2, max_height * 2
+        for key in ('image_id', 'idx'):
+            if key in mosaic_target[0]:
+                merged_target[key] = mosaic_target[0][key]
+        for key, extent in (('orig_size', (canvas_width, canvas_height)),
+                            ('size', (canvas_height, canvas_width))):
+            if key in mosaic_target[0]:
+                merged_target[key] = torch.as_tensor(extent, dtype=mosaic_target[0][key].dtype)
 
         # Concatenate full-size masks along the object dimension
         if has_masks:

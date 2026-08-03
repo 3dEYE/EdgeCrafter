@@ -10,9 +10,6 @@ import os
 import random
 from typing import Any, Dict, List, Optional
 
-os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-
-import albumentations as A
 import cv2
 import numpy as np
 import PIL
@@ -31,6 +28,19 @@ from .._misc import (BoundingBoxes, Mask, SanitizeBoundingBoxes, Video,
 torchvision.disable_beta_transforms_warning()
 
 
+def _import_albumentations():
+    """Import albumentations lazily so it stays optional for other pipelines."""
+    os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+    try:
+        import albumentations
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "AlbumentationsImageOnly requires the `albumentations` package: "
+            "pip install 'albumentations>=1.4.21'"
+        ) from exc
+    return albumentations
+
+
 @register()
 class AlbumentationsImageOnly(T.Transform):
     """Apply non-spatial Albumentations transforms without modifying targets."""
@@ -40,6 +50,7 @@ class AlbumentationsImageOnly(T.Transform):
     def __init__(self, blur_p: float = 0.01, median_blur_p: float = 0.01,
                  to_gray_p: float = 0.01, clahe_p: float = 0.01) -> None:
         super().__init__()
+        A = _import_albumentations()
         self.albumentations = A.Compose([
             A.Blur(p=blur_p),
             A.MedianBlur(p=median_blur_p),
@@ -505,8 +516,9 @@ class MixUp(object):
     
     # Target keys that need to be concatenated during mixup
     CONCAT_KEYS = ('boxes', 'keypoints', 'labels', 'iscrowd', 'area')
-    # Target keys that should be preserved from base image only
-    PRESERVE_KEYS = ('size',)
+    # Image-level keys carried over from the base image. Anything missing here is
+    # dropped from the target, which leaves the batch with heterogeneous targets.
+    PRESERVE_KEYS = ('size', 'orig_size', 'image_id', 'idx')
     
     def __init__(self, p: float = 0.5, max_cached_images: int = 50, 
                  random_pop: bool = True, default_num_keypoints: int = 17):
@@ -544,9 +556,14 @@ class MixUp(object):
         return mix_item['img'], copy.deepcopy(mix_item['target'])
     
     def _resize_target(self, target: dict, scale_x: float, scale_y: float) -> dict:
-        """Resize target annotations (boxes and keypoints) by scale factors."""
+        """Resize target annotations (boxes, keypoints and area) by scale factors."""
         target = copy.deepcopy(target)
-        
+
+        # `area` feeds the OKS denominator, so it has to follow the same rescale
+        # the coordinates get; otherwise mixed-in objects get the wrong scale.
+        if 'area' in target:
+            target['area'] = target['area'] * (scale_x * scale_y)
+
         if 'boxes' in target:
             boxes = target['boxes']
             scaled = [[x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y] 
@@ -897,6 +914,10 @@ class MixUpCopyPaste(object):
 
 @register()
 class PoseMosaic(object):
+    # Keys describing the sample as a whole rather than its objects. Concatenating
+    # them would leave one mosaic sample with four ids and four size pairs.
+    IMAGE_LEVEL_KEYS = ('image_id', 'idx', 'orig_size', 'size')
+
     def __init__(self, output_size=320, max_size=None,) -> None:
         super().__init__()
         self.resize = RandomResize(sizes=[output_size], max_size=max_size)
@@ -946,6 +967,8 @@ class PoseMosaic(object):
         offsets_pose = torch.tensor([[0, 0, 0], [max_width, 0, 0], [0, max_height, 0], [max_width, max_height, 0]])
         merged_target = {}
         for key in targets[0]:
+            if key in self.IMAGE_LEVEL_KEYS:
+                continue
             if key == 'boxes':
                 values = [target[key] + offsets[i] for i, target in enumerate(targets)]
             elif key == 'keypoints':
@@ -954,6 +977,17 @@ class PoseMosaic(object):
                 values = [target[key] for target in targets]
 
             merged_target[key] = torch.cat(values, dim=0) if isinstance(values[0], torch.Tensor) else values
+
+        # The mosaic is one new sample: keep the base sample's identity and report
+        # the canvas it now occupies. `orig_size` is (w, h) and `size` is (h, w).
+        canvas_width, canvas_height = max_width * 2, max_height * 2
+        for key in ('image_id', 'idx'):
+            if key in targets[0]:
+                merged_target[key] = targets[0][key]
+        for key, extent in (('orig_size', (canvas_width, canvas_height)),
+                            ('size', (canvas_height, canvas_width))):
+            if key in targets[0]:
+                merged_target[key] = torch.as_tensor(extent, dtype=targets[0][key].dtype)
 
         return merged_image, merged_target
 

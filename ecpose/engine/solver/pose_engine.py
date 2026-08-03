@@ -28,7 +28,10 @@ def train_one_epoch(self_lr_scheduler,
                     warmup_scheduler=None,
                     ema=None,
                     args=None):
-    scaler = torch.amp.GradScaler(str(device), enabled=True) # FIXME
+    # Autocast and the gradient scaler must share one switch: a fp16 forward pass
+    # whose gradients are never scaled underflows to zero.
+    use_amp = bool(getattr(args, 'use_amp', False))
+    scaler = torch.amp.GradScaler(str(device), enabled=use_amp)
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -61,17 +64,16 @@ def train_one_epoch(self_lr_scheduler,
             new_samples = new_samples.to(device)
             new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
 
-            with torch.amp.autocast(str(device), enabled=True):
+            with torch.amp.autocast(str(device), enabled=use_amp):
                 outputs = model(new_samples, new_targets)
-            
+
             with torch.amp.autocast(str(device), enabled=False):
                 loss_dict = criterion(outputs, new_targets)
                 losses = sum(loss_dict.values())
 
-            if args.use_amp:
-                scaler.scale(losses).backward()
-            else:
-                losses.backward()
+            # A disabled GradScaler passes scale/unscale_/step/update straight
+            # through, so one code path covers both precisions.
+            scaler.scale(losses).backward()
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -85,17 +87,12 @@ def train_one_epoch(self_lr_scheduler,
             sys.exit(1)
 
 
-        if args.use_amp:
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            optimizer.step()
-                    
+        if max_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        scaler.step(optimizer)
+        scaler.update()
+
         if ema is not None:
             ema.update(model)
             

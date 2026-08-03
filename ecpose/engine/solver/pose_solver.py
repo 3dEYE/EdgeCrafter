@@ -65,13 +65,18 @@ class PoseSolver(BaseSolver):
         self.self_lr_scheduler = False
         if hasattr(self.cfg, "lrsheduler") and self.cfg.lrsheduler is not None:
             iter_per_epoch = len(self.train_dataloader)
+            # Keep the warm-up short on small datasets, where a fixed iteration
+            # budget can otherwise span a large part of the run.
+            warmup_iter = min(self.cfg.warmup_iter, 3 * iter_per_epoch)
             print("     ## Using Self-defined Scheduler-{} (pose) ## ".format(self.cfg.lrsheduler))
+            print(f'FlatCosineLRScheduler with flat_epochs: {self.cfg.flat_epoch}, '
+                  f'no_aug_epochs: {self.cfg.no_aug_epoch}, warmup_iter: {warmup_iter}')
             self.lr_scheduler = FlatCosineLRScheduler(
                 self.optimizer,
                 self.cfg.lr_gamma,
                 iter_per_epoch,
                 total_epochs=self.cfg.epoches,
-                warmup_iter=self.cfg.warmup_iter,
+                warmup_iter=warmup_iter,
                 flat_epochs=self.cfg.flat_epoch,
                 no_aug_epochs=self.cfg.no_aug_epoch,
             )
@@ -160,6 +165,10 @@ class PoseSolver(BaseSolver):
             if not self.self_lr_scheduler:
                 if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
                     self.lr_scheduler.step()
+
+            # Every checkpoint below stores `last_epoch`; without this the value
+            # stays at -1 and `--resume` silently restarts from epoch 0.
+            self.last_epoch = epoch
 
             if self.output_dir:
                 checkpoint_paths = [self.output_dir / 'checkpoint.pth']

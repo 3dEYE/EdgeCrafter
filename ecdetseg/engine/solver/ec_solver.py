@@ -8,6 +8,7 @@ Copyright (c) 2024 D-FINE authors. All Rights Reserved.
 
 import datetime
 import json
+import math
 import time
 
 import torch
@@ -42,7 +43,10 @@ class ECSolver(BaseSolver):
         else:
             self.self_lr_scheduler = False
 
-        top1 = 0
+        # Start below every achievable score so that `best.pth` is written even
+        # while the metric is still 0.0, which is the normal state during the
+        # first epochs of a from-scratch run.
+        top1 = -math.inf
         best_stat = {'epoch': -1, }
         # evaluate again before resume training
         if self.last_epoch > 0:
@@ -76,8 +80,20 @@ class ECSolver(BaseSolver):
             if epoch == stop_aug_epoch:
                 if dist_utils.is_dist_available_and_initialized():
                     torch.distributed.barrier()
-                self.load_resume_state(str(self.output_dir / 'best.pth'))
-                self.last_epoch = epoch - 1
+                # Enter the no-augmentation stage from the best weights so far.
+                # `best.pth` can still be missing (no evaluated epoch improved on
+                # the resumed score), so fall back to the rolling checkpoint
+                # rather than aborting the run a couple of epochs before the end.
+                for name in ('best.pth', 'last.pth'):
+                    checkpoint = self.output_dir / name
+                    if checkpoint.exists():
+                        print(f'Reloading {name} before the no-augmentation stage')
+                        self.load_resume_state(str(checkpoint))
+                        self.last_epoch = epoch - 1
+                        break
+                else:
+                    print(f'No checkpoint found in {self.output_dir}; '
+                          'continuing the no-augmentation stage with the current weights')
 
             train_stats = train_one_epoch(
                 self.self_lr_scheduler,

@@ -6,7 +6,6 @@ postprocessor: DETRPosePostProcessor
 
 use_focal_loss: True
 eval_spatial_size: [640, 640] # h w
-checkpoint_freq: 4    # save freq
 grad_accum_steps: 1
 
 ECPose:
@@ -157,7 +156,8 @@ checkpoint_freq: 12
 sync_bn: True
 find_unused_parameters: False
 
-use_amp: False
+# `use_amp` is declared once, above; YAML keeps only the last duplicate, so a
+# second entry here would silently turn mixed precision off.
 scaler:
   type: GradScaler
-  enabled: False
+  enabled: True

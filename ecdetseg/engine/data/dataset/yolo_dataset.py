@@ -3,6 +3,7 @@ YOLO-format detection dataset support for EdgeCrafter.
 """
 
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -60,6 +61,9 @@ def _normalize_names(names: Any, num_classes: Optional[int]) -> List[str]:
 class YOLODetection(DetDataset):
     __inject__ = ["transforms"]
     __share__ = ["num_classes", "yolo_root", "yolo_data_file"]
+
+    #: How many individual label problems are spelled out before summarising.
+    max_reported_problems = 20
 
     def __init__(
         self,
@@ -125,6 +129,10 @@ class YOLODetection(DetDataset):
         self.bbox_to_mask = bbox_to_mask
         self.strict = strict
         self.validate_on_init = validate_on_init
+        # When set, invalid labels are collected instead of raised/warned so a
+        # single validation pass can report everything that is wrong.
+        self._problem_sink: Optional[List[str]] = None
+        self._skipped_labels = 0
 
         self.names = _normalize_names(names, num_classes)
         self.num_classes = int(num_classes if num_classes is not None else len(self.names))
@@ -345,15 +353,36 @@ class YOLODetection(DetDataset):
         return boxes_t, labels_t, masks_t, segments
 
     def _validate_dataset(self) -> None:
-        """Validate every image/label pair before a dataloader starts yielding batches."""
-        for image_path in self.image_files:
-            if self.normalized:
-                width, height = 1, 1
-            else:
-                with Image.open(image_path) as image:
-                    width, height = image.size
+        """Validate every image/label pair before a dataloader starts yielding batches.
 
-            self._validate_label_file(self._label_path(image_path), width, height)
+        Every problem in the dataset is collected in one pass, so a run is not
+        aborted once per broken line until the last one is fixed.
+        """
+        problems: List[str] = []
+        self._problem_sink = problems
+        try:
+            for image_path in self.image_files:
+                if self.normalized:
+                    width, height = 1, 1
+                else:
+                    with Image.open(image_path) as image:
+                        width, height = image.size
+
+                self._validate_label_file(self._label_path(image_path), width, height)
+        finally:
+            self._problem_sink = None
+
+        if not problems:
+            return
+
+        listed = "\n".join(problems[: self.max_reported_problems])
+        hidden = len(problems) - self.max_reported_problems
+        if hidden > 0:
+            listed += f"\n... and {hidden} more"
+        summary = f"Found {len(problems)} invalid label(s) under {self.img_folder}:\n{listed}"
+        if self.strict:
+            raise ValueError(summary)
+        warnings.warn(f"{summary}\nThese objects are skipped (strict=False).", UserWarning)
 
     def _validate_label_file(self, label_path: Path, width: int, height: int) -> None:
         if not label_path.exists():
@@ -371,8 +400,8 @@ class YOLODetection(DetDataset):
 
                 _, _, polygon = parsed
                 if self.return_masks and polygon is None and not self.bbox_to_mask:
-                    raise ValueError(
-                        f"Invalid label in {label_path}:{line_number}: detection bbox cannot be used as a mask"
+                    self._invalid_label(
+                        label_path, line_number, "detection bbox cannot be used as a mask"
                     )
 
     def _parse_line(
@@ -439,8 +468,22 @@ class YOLODetection(DetDataset):
 
     def _invalid_label(self, label_path: Path, line_number: int, reason: str):
         message = f"Invalid label in {label_path}:{line_number}: {reason}"
+        if self._problem_sink is not None:
+            self._problem_sink.append(message)
+            return None
         if self.strict:
             raise ValueError(message)
+        # Silently dropping objects looks like a clean run on broken data, so say
+        # so at least once per worker.
+        self._skipped_labels += 1
+        if self._skipped_labels <= self.max_reported_problems:
+            warnings.warn(f"{message}; skipping this object", UserWarning, stacklevel=2)
+        elif self._skipped_labels == self.max_reported_problems + 1:
+            warnings.warn(
+                f"More invalid labels under {self.img_folder}; further reports suppressed",
+                UserWarning,
+                stacklevel=2,
+            )
         return None
 
     def _scale_xy(self, x: float, y: float, width: int, height: int) -> Tuple[float, float]:

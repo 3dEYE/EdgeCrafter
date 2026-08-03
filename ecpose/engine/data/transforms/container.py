@@ -23,6 +23,11 @@ torchvision.disable_beta_transforms_warning()
 
 @register()
 class Compose(T.Compose):
+    # Augmentations that blend two samples together. They follow the mosaic
+    # window rather than the outer `policy['ops']` window, so they are matched by
+    # class name here instead of being listed in the config.
+    mixup_ops = ('MixUp', 'MixUpCopyPaste')
+
     def __init__(self, ops, policy=None, mosaic_prob=-0.1) -> None:
         transforms = []
         if ops is not None:
@@ -49,6 +54,24 @@ class Compose(T.Compose):
         self.global_samples = 0
         self.policy = policy
         self.warning_mosaic_start = True
+        self._check_policy_ops()
+
+    def _check_policy_ops(self):
+        """Reject policy entries that match no configured op.
+
+        A name that matches nothing is silently ignored by the epoch gating, so
+        the op stays enabled for the whole run instead of being switched off.
+        """
+        if self.policy.get('name') != 'stop_epoch':
+            return
+        configured = {type(transform).__name__ for transform in self.transforms}
+        unknown = sorted(set(self.policy.get('ops', ())) - configured)
+        if unknown:
+            raise ValueError(
+                f"Augmentation policy lists ops that are not configured: {unknown}. "
+                f"Configured ops: {sorted(configured)}. Policy entries must match "
+                "the transform class names, otherwise those ops are never disabled."
+            )
 
     def __call__(self, image, target, dataset=None):
         return self.get_forward(self.policy['name'])(image, target, dataset)
@@ -81,7 +104,7 @@ class Compose(T.Compose):
                     pass
                 elif (type(transform).__name__ in policy_ops and cur_epoch >= policy_epoch[-1]):   
                     pass
-                elif (type(transform).__name__ == 'MixupCopypasteMosaic' and cur_epoch >= policy_epoch[1]):
+                elif (type(transform).__name__ in self.mixup_ops and cur_epoch >= policy_epoch[1]):
                     pass
                 else:
                     if (type(transform).__name__ == 'PoseMosaic' and not with_mosaic):    

@@ -55,7 +55,29 @@ class Compose(T.Compose):
         self.mosaic_epoch = mosaic_epoch
         self.stop_epoch = stop_epoch
         self.cur_epoch = 0
-        
+        if self.policy == 'stop_epoch':
+            self._check_remove_ops()
+
+    def _check_remove_ops(self):
+        """Validate the ops that the `stop_epoch` policy switches off.
+
+        ``remove_ops`` is matched against transform class names, so a missing or
+        misspelled entry silently keeps that augmentation enabled until the last
+        epoch instead of disabling it at ``stop_epoch``.
+        """
+        if self.strong_augmentation is None:
+            raise ValueError("policy='stop_epoch' requires `remove_ops` to be set")
+        if self.stop_epoch is None:
+            raise ValueError("policy='stop_epoch' requires `stop_epoch` to be set")
+        configured = {type(transform).__name__ for transform in self.transforms}
+        unknown = sorted(set(self.strong_augmentation) - configured)
+        if unknown:
+            raise ValueError(
+                f"`remove_ops` lists ops that are not configured: {unknown}. "
+                f"Configured ops: {sorted(configured)}. Entries must match the "
+                "transform class names, otherwise those ops are never disabled."
+            )
+
     def set_epoch(self, epoch: int):
         self.cur_epoch = epoch
      

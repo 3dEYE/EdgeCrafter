@@ -31,6 +31,7 @@ class CocoEvaluator(object):
         plate_metrics=False,
         plate_score_threshold=0.25,
         plate_iou_threshold=0.5,
+        plate_miss_penalty=1.0,
     ):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
@@ -44,6 +45,9 @@ class CocoEvaluator(object):
         self.plate_metrics = plate_metrics
         self.plate_score_threshold = float(plate_score_threshold)
         self.plate_iou_threshold = float(plate_iou_threshold)
+        # Normalised corner error charged to every ground-truth plate that no
+        # prediction matched. 1.0 == the whole plate diagonal.
+        self.plate_miss_penalty = float(plate_miss_penalty)
         self.plate_records = []
         self.plate_summary = {}
 
@@ -137,6 +141,7 @@ class CocoEvaluator(object):
             print(
                 "Plate metrics: "
                 f"LP-NME={self.plate_summary['plate_nme']:.6f}, "
+                f"LP-NME(with misses)={self.plate_summary['plate_nme_penalized']:.6f}, "
                 f"P95={self.plate_summary['plate_nme_p95']:.6f}, "
                 f"precision={self.plate_summary['plate_precision']:.4f}, "
                 f"recall={self.plate_summary['plate_recall']:.4f}, "
@@ -255,7 +260,18 @@ class CocoEvaluator(object):
         def aggregate(values, operation):
             return float(operation(values)) if values.size else float("nan")
 
+        # Mean corner error over every ground-truth plate, charging misses the
+        # full penalty. Unlike `plate_nme` this cannot be gamed by predicting
+        # only the few easy plates, so it is safe to select checkpoints on.
+        if ground_truth:
+            penalized_nme = float(
+                (nmes.sum() + self.plate_miss_penalty * (ground_truth - matches)) / ground_truth
+            )
+        else:
+            penalized_nme = float("nan")
+
         return {
+            "plate_nme_penalized": penalized_nme,
             "plate_nme": aggregate(nmes, np.mean),
             "plate_nme_median": aggregate(nmes, np.median),
             "plate_nme_p95": aggregate(nmes, lambda values: np.percentile(values, 95)),

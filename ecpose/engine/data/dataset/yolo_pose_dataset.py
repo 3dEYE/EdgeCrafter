@@ -1,6 +1,7 @@
 """YOLO four-corner keypoint dataset support for ECPose."""
 
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -63,6 +64,9 @@ class YOLOPoseDetection(DetDataset):
     keypoint_names = ["left_top", "right_top", "right_bottom", "left_bottom"]
     skeleton = [[1, 2], [2, 3], [3, 4], [4, 1]]
 
+    #: How many individual label problems are spelled out before summarising.
+    max_reported_problems = 20
+
     def __init__(
         self,
         img_folder: Optional[str] = None,
@@ -122,6 +126,10 @@ class YOLOPoseDetection(DetDataset):
         self.normalized = normalized
         self.strict = strict
         self.validate_on_init = validate_on_init
+        # When set, invalid labels are collected instead of raised/warned so a
+        # single validation pass can report everything that is wrong.
+        self._problem_sink: Optional[List[str]] = None
+        self._skipped_labels = 0
 
         extensions = image_extensions or [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
         self.image_extensions = {
@@ -280,13 +288,32 @@ class YOLOPoseDetection(DetDataset):
         raise ValueError(f"Cannot infer label path for {image_path}; provide label_folder")
 
     def _validate_dataset(self) -> None:
-        for image_path in self.image_files:
-            if self.normalized:
-                width, height = 1, 1
-            else:
-                with Image.open(image_path) as image:
-                    width, height = image.size
-            self._parse_label_file(self._label_path(image_path), width, height)
+        """Collect every label problem in one pass instead of failing on the first."""
+        problems: List[str] = []
+        self._problem_sink = problems
+        try:
+            for image_path in self.image_files:
+                if self.normalized:
+                    width, height = 1, 1
+                else:
+                    with Image.open(image_path) as image:
+                        width, height = image.size
+                self._parse_label_file(self._label_path(image_path), width, height)
+        finally:
+            self._problem_sink = None
+
+        if not problems:
+            return
+
+        listed = "\n".join(problems[: self.max_reported_problems])
+        hidden = len(problems) - self.max_reported_problems
+        if hidden > 0:
+            listed += f"\n... and {hidden} more"
+        location = self.img_folder or self.root
+        summary = f"Found {len(problems)} invalid label(s) under {location}:\n{listed}"
+        if self.strict:
+            raise ValueError(summary)
+        warnings.warn(f"{summary}\nThese objects are skipped (strict=False).", UserWarning)
 
     def _parse_label_file(self, label_path: Path, width: int, height: int):
         if not label_path.exists():
@@ -355,8 +382,22 @@ class YOLOPoseDetection(DetDataset):
 
     def _invalid_label(self, label_path: Path, line_number: int, reason: str):
         message = f"Invalid label in {label_path}:{line_number}: {reason}"
+        if self._problem_sink is not None:
+            self._problem_sink.append(message)
+            return None
         if self.strict:
             raise ValueError(message)
+        # Silently dropping objects looks like a clean run on broken data, so say
+        # so at least once per worker.
+        self._skipped_labels += 1
+        if self._skipped_labels <= self.max_reported_problems:
+            warnings.warn(f"{message}; skipping this object", UserWarning, stacklevel=2)
+        elif self._skipped_labels == self.max_reported_problems + 1:
+            warnings.warn(
+                f"More invalid labels under {self.img_folder or self.root}; further reports suppressed",
+                UserWarning,
+                stacklevel=2,
+            )
         return None
 
     @staticmethod

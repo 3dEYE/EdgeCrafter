@@ -6,6 +6,7 @@ evaluator:
   plate_metrics: True
   plate_score_threshold: 0.25
   plate_iou_threshold: 0.5
+  plate_miss_penalty: 1.0   # NME charged per missed plate, in plate diagonals
 
 num_classes: 1
 remap_mscoco_category: False

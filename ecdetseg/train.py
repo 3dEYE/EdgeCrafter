@@ -32,6 +32,9 @@ debug=False
 
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("always", message=".*stop_epoch.*")
+# Dataset problems must not be swallowed by the blanket ignore above, otherwise a
+# run on broken annotations looks clean.
+warnings.filterwarnings("always", message="(?i).*invalid label.*")
 
 if debug:
     import torch

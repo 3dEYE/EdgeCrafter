@@ -29,6 +29,9 @@ debug=False
 
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("always", message=".*stop_epoch.*")
+# Dataset problems must not be swallowed by the blanket ignore above, otherwise a
+# run on broken annotations looks clean.
+warnings.filterwarnings("always", message="(?i).*invalid label.*")
 
 if debug:
     import torch
@@ -126,7 +129,13 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint')
     parser.add_argument('-d', '--device', type=str, help='device',)
     parser.add_argument('--seed', type=int, default=0, help='exp reproducibility')
-    parser.add_argument('--use-amp', action='store_true', help='auto mixed precision training')
+    # Default None so the config value survives: `update_dict` drops None entries,
+    # while a plain store_true default would always overwrite `use_amp` with False.
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument('--use-amp', dest='use_amp', action='store_true',
+                           default=None, help='enable mixed precision training')
+    amp_group.add_argument('--no-amp', dest='use_amp', action='store_false',
+                           default=None, help='disable mixed precision training')
     parser.add_argument('--output-dir', type=str, help='output directoy')
     parser.add_argument('--summary-dir', type=str, help='tensorboard summry')
     parser.add_argument('--test-only', action='store_true', default=False,)

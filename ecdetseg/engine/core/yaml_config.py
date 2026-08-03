@@ -182,7 +182,9 @@ class YAMLConfig(BaseConfig):
             'max_workers': None if name == 'train_dataloader' else 4,
             'pin_memory': True,
             'persistent_workers': True,
-            'prefetch_factor': 1,
+            # Torch's default. Anything lower starves the GPU whenever a batch
+            # takes longer to build than the previous step takes to run.
+            'prefetch_factor': 2,
         }
         loader_cfg = global_cfg[name]
         runtime_kwargs = {

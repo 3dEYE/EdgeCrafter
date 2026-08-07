@@ -36,8 +36,16 @@ class ECSolver(BaseSolver):
             warmup_iter = min(args.warmup_iter, 3 * iter_per_epoch)  
             
             print(f'FlatCosineLRScheduler with flat_epochs: {flat_epochs}, no_aug_epochs: {no_aug_epochs}, warmup_iter: {args.warmup_iter}')
-            self.lr_scheduler = FlatCosineLRScheduler(self.optimizer, args.lr_gamma, iter_per_epoch, total_epochs=args.epochs, 
-                                                warmup_iter=warmup_iter, flat_epochs=flat_epochs, no_aug_epochs=no_aug_epochs)
+            self.lr_scheduler = FlatCosineLRScheduler(
+                self.optimizer,
+                args.lr_gamma,
+                iter_per_epoch,
+                total_epochs=args.epochs,
+                warmup_iter=warmup_iter,
+                flat_epochs=flat_epochs,
+                no_aug_epochs=no_aug_epochs,
+                base_lrs=self.optimizer_base_lrs,
+            )
             self.self_lr_scheduler = True
         else:
             self.self_lr_scheduler = False

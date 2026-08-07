@@ -82,6 +82,9 @@ class BaseSolver(object):
     def train(self):
         self._setup()
         self.optimizer = self.cfg.optimizer
+        self.optimizer_base_lrs = tuple(
+            group["lr"] for group in self.optimizer.param_groups
+        )
         self.lr_scheduler = self.cfg.lr_scheduler
         self.lr_warmup_scheduler = self.cfg.lr_warmup_scheduler
 

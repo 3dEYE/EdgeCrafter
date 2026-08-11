@@ -1,4 +1,4 @@
-<h1 align="center">EdgeCrafter: Compact ViTs for Edge Dense Prediction via
+<h1 align="center">[TMLR 26] EdgeCrafter: Compact ViTs for Edge Dense Prediction via
 Task-Specialized Distillation</h1>
 
 <h3 align="center">
@@ -38,6 +38,7 @@ Task-Specialized Distillation</h1>
 ---
 
 ## 🚀 Updates
+- **[2026-08-11]** EdgeCrafter has been accepted for publication in **TMLR 2026** 🎉 
 - **[2026-07-23]** EdgeCrafter has been integrated into [LightlyTrain](https://docs.lightly.ai/train/stable/pretrain_distill/models/edgecrafter.html)
 - **[2026-07-22]** EdgeCrafter has been integrated into [LibreYOLO](https://www.libreyolo.com/zh).
 - **[2026-04-20]** Our previous version [DEIMv2](https://github.com/Intellindust-AI-Lab/DEIMv2) was used by two winning teams at the [CVPR 2026 Maritime Computer Vision Workshop](https://arxiv.org/abs/2604.13244), taking home 2nd place in Thermal Object Detection Challenge and 3rd place in Vision-to-Chart Data Association Challenge.
@@ -136,7 +137,7 @@ If you find this project useful in your research, please consider citing:
 @article{liu2026edgecrafter,
   title={EdgeCrafter: Compact ViTs for Edge Dense Prediction via Task-Specialized Distillation},
   author={Liu, Longfei and Hou, Yongjie and Li, Yang and Wang, Qirui and Sha, Youyang and Yu, Yongjun and Wang, Yinzhi and Ru, Peizhe and Yu, Xuanlong and Shen, Xi},
-  journal={arXiv},
+  journal={TMLR},
   year={2026}
 }
 ```

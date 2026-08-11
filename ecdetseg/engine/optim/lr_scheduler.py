@@ -44,13 +44,23 @@ class FlatCosineLRScheduler:
         lr_gamma (float): Scaling factor for the minimum learning rate.
         iter_per_epoch (int): Number of iterations per epoch.
         total_epochs (int): Total number of training epochs.
-        warmup_epochs (int): Number of warm-up epochs.
+        warmup_iter (int): Number of warm-up iterations.
         flat_epochs (int): Number of flat epochs (for flat-cosine scheduler).
         no_aug_epochs (int): Number of no-augmentation epochs.
+        base_lrs (Sequence[float], optional): Configured learning rate for each
+            optimizer parameter group. Defaults to the optimizer's current
+            learning rates for backward compatibility.
     """
-    def __init__(self, optimizer, lr_gamma, iter_per_epoch, total_epochs, 
-                 warmup_iter, flat_epochs, no_aug_epochs):
-        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+    def __init__(self, optimizer, lr_gamma, iter_per_epoch, total_epochs,
+                 warmup_iter, flat_epochs, no_aug_epochs, base_lrs=None):
+        if base_lrs is None:
+            base_lrs = [group["lr"] for group in optimizer.param_groups]
+        if len(base_lrs) != len(optimizer.param_groups):
+            raise ValueError(
+                "base_lrs must contain one value per optimizer parameter group"
+            )
+
+        self.base_lrs = list(base_lrs)
         self.min_lrs = [base_lr * lr_gamma for base_lr in self.base_lrs]
 
         total_iter = int(iter_per_epoch * total_epochs)

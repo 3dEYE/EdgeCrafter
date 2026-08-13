@@ -38,6 +38,7 @@ Task-Specialized Distillation</h1>
 
 ## 🚀 更新日志
 
+- **[2026-08-13]** EdgeCrafter 已集成到 [Intel® Geti™](https://github.com/open-edge-platform/geti)：无需编写代码即可在自有数据上微调 ECDet-S/M/L/X，支持在 Intel 独立显卡 / 集成显卡 / CPU 上训练，并导出为 OpenVINO™ IR 以及 INT8 优化模型用于边缘部署。
 - **[2026-03-21]** <a href="https://huggingface.co/Intellindust">模型已发布至 🤗 Hugging Face</a>。
 - **[2026-03-19]** EdgeCrafter 初始版本正式发布。
 

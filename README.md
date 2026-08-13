@@ -38,6 +38,7 @@ Task-Specialized Distillation</h1>
 ---
 
 ## 🚀 Updates
+- **[2026-08-13]** EdgeCrafter has been integrated into [Intel® Geti™](https://github.com/open-edge-platform/geti): fine-tune ECDet-S/M/L/X on your own data with no code, train on Intel dGPU / iGPU / CPU, export to OpenVINO™ IR and optimized for INT8 for edge deployment.
 - **[2026-08-11]** EdgeCrafter has been accepted for publication in **TMLR 2026** 🎉 
 - **[2026-07-23]** EdgeCrafter has been integrated into [LightlyTrain](https://docs.lightly.ai/train/stable/pretrain_distill/models/edgecrafter.html)
 - **[2026-07-22]** EdgeCrafter has been integrated into [LibreYOLO](https://www.libreyolo.com/zh).

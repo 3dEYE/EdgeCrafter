@@ -15,13 +15,18 @@
 
 ### COCO2017 Validation Results (Keypoints)
 
+> `--` 表示仅使用 COCO 训练，`O365` 表示额外使用 Objects365 预训练。`O365` 结果来自直接迁移经 Objects365 预训练的检测模型。
 
-| Model | Size | AP<sub>50:95</sub> | #Params | GFLOPs | Latency (ms) | Config | Log | Checkpoint |
-|:-----:|:----:|:--:|:-------:|:------:|:------------:|:------:|:---:|:----------:|
-| **ECPose-S** | 640 | 68.9 |  10 | 30 | 5.54 | [config](configs/ecpose/ecpose_s_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_s.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_s.pth) |
-| **ECPose-M** | 640 | 72.4 |  20 | 63 | 9.25 | [config](configs/ecpose/ecpose_m_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_m.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_m.pth) |
-| **ECPose-L** | 640 | 73.5 |  34 | 112 | 11.83 | [config](configs/ecpose/ecpose_l_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_l.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_l.pth) |
-| **ECPose-X** | 640 | 74.8 |  51 | 172 | 14.31 | [config](configs/ecpose/ecpose_x_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_x.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_x.pth) |
+| Model | Extra Sup. | Size | AP<sub>50:95</sub> | #Params | GFLOPs | Latency (ms) | Config | Log | Checkpoint |
+|:-----:|:----------:|:----:|:------------------:|:-------:|:------:|:------------:|:------:|:---:|:----------:|
+| **ECPose-S** | -- | 640 | 68.9 | 10 | 30 | 5.54 | [config](configs/ecpose/ecpose_s_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_s.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_s.pth) |
+| **ECPose-S** | O365 | 640 | 69.7 | 10 | 30 | 5.54 | - | - | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1_o365/ecpose_s_o3652coco.pth) |
+| **ECPose-M** | -- | 640 | 72.4 | 20 | 63 | 9.25 | [config](configs/ecpose/ecpose_m_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_m.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_m.pth) |
+| **ECPose-M** | O365 | 640 | 73.1 | 20 | 63 | 9.25 | - | - | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1_o365/ecpose_m_o3652coco.pth) |
+| **ECPose-L** | -- | 640 | 73.5 | 34 | 112 | 11.83 | [config](configs/ecpose/ecpose_l_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_l.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_l.pth) |
+| **ECPose-L** | O365 | 640 | 74.5 | 34 | 112 | 11.83 | - | - | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1_o365/ecpose_l_o3652coco.pth) |
+| **ECPose-X** | -- | 640 | 74.8 | 51 | 172 | 14.31 | [config](configs/ecpose/ecpose_x_coco.yml) | [log](https://github.com/capsule2077/edgecrafter/raw/refs/heads/main/logs/ecpose_x.log) | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_x.pth) |
+| **ECPose-X** | O365 | 640 | 75.9 | 51 | 172 | 14.31 | - | - | [model](https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1_o365/ecpose_x_o3652coco.pth) |
 
 ---
 

@@ -51,13 +51,16 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     if sample_dtype == torch.float16 and scaler is None:
         raise ValueError('float16 input training requires AMP/GradScaler to be enabled')
 
-    cur_iters = epoch * len(data_loader)
-
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device=device, dtype=sample_dtype, non_blocking=True)
         targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
+
+        # Apply the per-iteration schedule before updating the model so the
+        # first optimizer step cannot bypass warm-up at the configured base LR.
+        if self_lr_scheduler:
+            optimizer = lr_scheduler.step(global_step, optimizer)
 
         if scaler is not None:
             with torch.autocast(device_type=device.type, dtype=torch.float16, cache_enabled=True):
@@ -106,11 +109,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         if ema is not None:
             ema.update(model)
 
-        if self_lr_scheduler:
-            optimizer = lr_scheduler.step(cur_iters + i, optimizer)
-        else:
-            if lr_warmup_scheduler is not None:
-                lr_warmup_scheduler.step()
+        if not self_lr_scheduler and lr_warmup_scheduler is not None:
+            lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())

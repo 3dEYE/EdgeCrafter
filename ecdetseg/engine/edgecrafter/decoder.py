@@ -287,6 +287,33 @@ class TransformerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos):
         return tensor if pos is None else tensor + pos
 
+    def _self_attention_forward(self, target, query_pos_embed, attn_mask):
+        query = key = self.with_pos_embed(target, query_pos_embed)
+
+        if torch.is_autocast_enabled(target.device.type):
+            fp32_attn_mask = (
+                attn_mask.float()
+                if torch.is_tensor(attn_mask) and attn_mask.is_floating_point()
+                else attn_mask
+            )
+            with torch.autocast(device_type=target.device.type, enabled=False):
+                fp32_query = query.float()
+                target2, _ = self.self_attn(
+                    fp32_query,
+                    fp32_query,
+                    value=target.float(),
+                    attn_mask=fp32_attn_mask,
+                )
+        else:
+            target2, _ = self.self_attn(
+                query,
+                key,
+                value=target,
+                attn_mask=attn_mask,
+            )
+
+        return target2
+
     def forward(self,
                 target,
                 reference_points,
@@ -296,9 +323,9 @@ class TransformerDecoderLayer(nn.Module):
                 query_pos_embed=None):
 
         # self attention
-        q = k = self.with_pos_embed(target, query_pos_embed)
-
-        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
+        # Large decoder queries can overflow FP16 attention score computation
+        # before GradScaler gets a chance to inspect the backward pass.
+        target2 = self._self_attention_forward(target, query_pos_embed, attn_mask)
         target = target + self.dropout1(target2)
         target = self.norm1(target)
 

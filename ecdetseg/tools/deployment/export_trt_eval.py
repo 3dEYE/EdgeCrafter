@@ -21,6 +21,13 @@ from engine.core import YAMLConfig
 from engine.core.yaml_utils import merge_dict, parse_cli
 from engine.data import CocoEvaluator, get_coco_api_from_dataset
 from engine.misc import MetricLogger
+from tools.deployment.onnx_dataflow_fp16 import (
+    DATAFLOW_FP16_POLICY,
+    DEFAULT_DATA_MAX,
+    DEFAULT_INIT_MAX,
+    apply_dataflow_fp16_precision,
+)
+from tools.deployment.onnx_precision import read_precision_policy
 
 
 def _parse_input_size(input_size: Optional[List[int]]) -> Optional[List[int]]:
@@ -351,6 +358,73 @@ def _restore_optimizer_clip_bounds(model_path: Path, unoptimized_model) -> int:
     return restored
 
 
+def write_modelopt_calibration_data(
+    cfg: YAMLConfig,
+    output_path: Path,
+    sample_count: int,
+    export_mode: str,
+    input_dtype: str,
+) -> Path:
+    """Write real validation tensors for ModelOpt calibration/activation analysis."""
+    import numpy as np
+
+    if sample_count <= 0:
+        raise ValueError("ModelOpt calibration sample count must be positive.")
+
+    image_chunks = []
+    size_chunks = []
+    collected = 0
+    for samples, targets in cfg.val_dataloader:
+        take = min(sample_count - collected, int(samples.shape[0]))
+        image_chunks.append(samples[:take].detach().cpu())
+        if export_mode == "pixel":
+            size_chunks.append(
+                torch.stack([target["orig_size"] for target in targets[:take]], dim=0).cpu()
+            )
+        collected += take
+        if collected >= sample_count:
+            break
+
+    if collected != sample_count:
+        raise ValueError(
+            f"Validation set provided {collected} calibration samples; requested {sample_count}."
+        )
+
+    image_torch_dtype = torch.float16 if input_dtype == "float16" else torch.float32
+    arrays = {
+        "images": torch.cat(image_chunks, dim=0).to(image_torch_dtype).contiguous().numpy()
+    }
+    if export_mode == "pixel":
+        arrays["orig_target_sizes"] = torch.cat(size_chunks, dim=0).float().contiguous().numpy()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **arrays)
+    images = arrays["images"]
+    print(
+        f"Saved {sample_count} real validation sample(s) for ModelOpt calibration: {output_path} "
+        f"shape={images.shape}, dtype={images.dtype}, range=[{images.min():.6g}, {images.max():.6g}]"
+    )
+    return output_path
+
+
+def _write_fp16_calibration(
+    cfg: YAMLConfig,
+    output_path: Path,
+    sample_count: int,
+    export_mode: str,
+    input_dtype: str,
+) -> Path:
+    """Backward-compatible name for the existing FP16 dataflow policy."""
+    return write_modelopt_calibration_data(
+        cfg,
+        output_path,
+        sample_count=sample_count,
+        export_mode=export_mode,
+        input_dtype=input_dtype,
+    )
+
+
 def export_onnx(
     cfg: YAMLConfig,
     checkpoint: str,
@@ -364,9 +438,17 @@ def export_onnx(
     export_mode: str,
     input_dtype: str = "float16",
     onnx_exporter: str = "legacy",
+    onnx_precision_policy: str = "baseline",
+    fp16_report: Optional[Path] = None,
+    fp16_calibration_data: Optional[Path] = None,
+    fp16_calibration_samples: int = 1,
+    fp16_data_max: float = DEFAULT_DATA_MAX,
+    fp16_init_max: float = DEFAULT_INIT_MAX,
 ) -> Path:
     if onnx_exporter not in ("legacy", "dynamo"):
         raise ValueError(f"Unsupported ONNX exporter: {onnx_exporter}")
+    if onnx_precision_policy not in ("baseline", "explicit-fp16-dataflow"):
+        raise ValueError(f"Unsupported ONNX precision policy: {onnx_precision_policy}")
     if "ViTAdapter" in cfg.yaml_cfg:
         cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
     _load_checkpoint_model(cfg, checkpoint, strict=strict_load)
@@ -468,6 +550,35 @@ def export_onnx(
         onnx.save(onnx_model_simplify, str(output_file), save_as_external_data=False)
         print(f"ONNX simplify: {ok}")
 
+    if onnx_precision_policy == "explicit-fp16-dataflow":
+        calibration_path = (
+            Path(fp16_calibration_data)
+            if fp16_calibration_data
+            else output_file.with_suffix(".fp16-calibration.npz")
+        )
+        if fp16_calibration_data is None:
+            _write_fp16_calibration(
+                cfg,
+                calibration_path,
+                sample_count=fp16_calibration_samples,
+                export_mode=export_mode,
+                input_dtype=input_dtype,
+            )
+        report = apply_dataflow_fp16_precision(
+            output_file,
+            calibration_path=calibration_path,
+            report_path=fp16_report,
+            data_max=fp16_data_max,
+            init_max=fp16_init_max,
+        )
+        converted_initializers = report["converted_initializers"]["count"]
+        print(
+            "Applied calibrated dataflow FP16 policy: "
+            f"{report['graph']['cast_node_count']} Cast nodes, "
+            f"initializers={converted_initializers}."
+        )
+        print(f"Saved calibrated FP16 policy report: {report['report']}")
+
     return output_file
 
 
@@ -513,6 +624,22 @@ def _precision_supported(builder, trt, precision: str) -> bool:
         fast_fp8 = getattr(builder, "platform_has_fast_fp8", None)
         return True if fast_fp8 is None else bool(fast_fp8)
     raise ValueError(f"Unsupported precision: {precision}")
+
+
+def _network_creation_flags(trt, strongly_typed: bool) -> int:
+    flags = (
+        0
+        if _trt_major(trt) >= 10
+        else (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    )
+    if not strongly_typed:
+        return flags
+    if not hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"):
+        raise RuntimeError(
+            f"TensorRT {trt.__version__} does not expose STRONGLY_TYPED networks; "
+            "explicit ONNX precision policy cannot be enforced."
+        )
+    return flags | (1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
 
 
 def _set_profile(
@@ -654,6 +781,7 @@ def build_engine(
     workspace_gb: Optional[float],
     verbose: bool,
     profiling_verbosity: str,
+    strongly_typed: bool = False,
 ) -> Optional[Path]:
     import tensorrt as trt
 
@@ -669,15 +797,15 @@ def build_engine(
     _set_workspace(config, trt, workspace_gb)
     _set_profiling_verbosity(config, trt, profiling_verbosity)
 
-    explicit_batch = 0 if _trt_major(trt) >= 10 else (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-    network = builder.create_network(explicit_batch)
+    network = builder.create_network(_network_creation_flags(trt, strongly_typed))
     parser = trt.OnnxParser(network, logger)
 
     if not parser.parse_from_file(str(onnx_file)):
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
         raise RuntimeError(f"Failed to parse ONNX file {onnx_file}:\n{errors}")
 
-    print(f"TensorRT {trt.__version__}: building {precision.upper()} engine")
+    typing_mode = "strongly typed" if strongly_typed else "weakly typed"
+    print(f"TensorRT {trt.__version__}: building {precision.upper()} engine ({typing_mode})")
     for i in range(network.num_inputs):
         inp = network.get_input(i)
         print(f'  input  {inp.name}: shape={tuple(inp.shape)} dtype={inp.dtype}')
@@ -685,15 +813,23 @@ def build_engine(
         out = network.get_output(i)
         print(f'  output {out.name}: shape={tuple(out.shape)} dtype={out.dtype}')
 
-    if precision == "fp32":
-        if hasattr(trt.BuilderFlag, "TF32") and hasattr(config, "clear_flag"):
-            config.clear_flag(trt.BuilderFlag.TF32)
-    elif precision == "fp16":
-        config.set_flag(trt.BuilderFlag.FP16)
-    elif precision == "fp8":
-        config.set_flag(trt.BuilderFlag.FP8)
-        if hasattr(trt.BuilderFlag, "FP16"):
+    if strongly_typed:
+        # Strong typing takes tensor and compute precision from the ONNX graph.
+        # TensorRT forbids the global FP16/FP8 builder flags in this mode.
+        if precision not in {"fp16", "fp8"}:
+            raise ValueError(
+                "Strongly typed export currently supports explicit FP16 or FP8 ONNX graphs."
+            )
+    else:
+        if precision == "fp32":
+            if hasattr(trt.BuilderFlag, "TF32") and hasattr(config, "clear_flag"):
+                config.clear_flag(trt.BuilderFlag.TF32)
+        elif precision == "fp16":
             config.set_flag(trt.BuilderFlag.FP16)
+        elif precision == "fp8":
+            config.set_flag(trt.BuilderFlag.FP8)
+            if hasattr(trt.BuilderFlag, "FP16"):
+                config.set_flag(trt.BuilderFlag.FP16)
 
     _set_profile(builder, config, network, min_batch, opt_batch, max_batch, image_hw)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1370,8 +1506,8 @@ def _select_cuda_device(gpu: Optional[int]) -> None:
 
 
 def main(args) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for TensorRT export/evaluation.")
+    if not args.onnx_only and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for TensorRT build/evaluation. Use --onnx-only for CPU export.")
     _validate_batch_request(
         args.static_batch,
         args.min_batch,
@@ -1379,7 +1515,14 @@ def main(args) -> None:
         args.max_batch,
         args.eval_batch_size,
     )
-    _select_cuda_device(args.gpu)
+    if not args.onnx_only:
+        _select_cuda_device(args.gpu)
+    if args.fp16_report and args.onnx_precision_policy != "explicit-fp16-dataflow":
+        raise ValueError("--fp16-report requires --onnx-precision-policy explicit-fp16-dataflow.")
+    if args.fp16_calibration_data and args.onnx_precision_policy != "explicit-fp16-dataflow":
+        raise ValueError(
+            "--fp16-calibration-data requires --onnx-precision-policy explicit-fp16-dataflow."
+        )
 
     cfg = _build_eval_cfg(args)
     img_h, img_w = cfg.yaml_cfg["eval_spatial_size"]
@@ -1401,9 +1544,28 @@ def main(args) -> None:
             export_mode=args.export_mode,
             input_dtype=args.input_dtype,
             onnx_exporter=args.onnx_exporter,
+            onnx_precision_policy=args.onnx_precision_policy,
+            fp16_report=Path(args.fp16_report) if args.fp16_report else None,
+            fp16_calibration_data=(
+                Path(args.fp16_calibration_data) if args.fp16_calibration_data else None
+            ),
+            fp16_calibration_samples=args.fp16_calibration_samples,
+            fp16_data_max=args.fp16_data_max,
+            fp16_init_max=args.fp16_init_max,
         )
     else:
         print(f"Using existing ONNX: {onnx_path}")
+
+    actual_precision_policy = read_precision_policy(onnx_path)
+    expected_precision_policy = {
+        "baseline": "baseline",
+        "explicit-fp16-dataflow": DATAFLOW_FP16_POLICY,
+    }[args.onnx_precision_policy]
+    if actual_precision_policy != expected_precision_policy:
+        raise ValueError(
+            f"ONNX precision policy mismatch: model has {actual_precision_policy!r}, "
+            f"requested {expected_precision_policy!r}. Re-export without --skip-onnx."
+        )
 
     onnx_contract = _read_onnx_contract(onnx_path)
     _validate_onnx_contract(
@@ -1415,6 +1577,9 @@ def main(args) -> None:
         static_batch=args.static_batch,
         opt_batch=args.opt_batch,
     )
+    if args.onnx_only:
+        print(f"ONNX-only export completed: {onnx_path}")
+        return
 
     def validate_engine(engine_path: Path) -> Dict[str, object]:
         engine_contract = _read_engine_contract(engine_path, args.verbose)
@@ -1460,6 +1625,7 @@ def main(args) -> None:
                 workspace_gb=args.workspace,
                 verbose=args.verbose,
                 profiling_verbosity=args.profiling_verbosity,
+                strongly_typed=actual_precision_policy == DATAFLOW_FP16_POLICY,
             )
             if built is not None:
                 validate_engine(built)
@@ -1545,6 +1711,49 @@ def parse_args():
         help="ONNX exporter backend (default: legacy for current TensorRT production compatibility).",
     )
     parser.add_argument(
+        "--onnx-precision-policy",
+        choices=["baseline", "explicit-fp16-dataflow"],
+        default="baseline",
+        help=(
+            "ONNX internal precision policy. explicit-fp16-dataflow uses real validation "
+            "activations plus minimal FP32 ranking/box-decoding islands and builds a "
+            "strongly typed TensorRT network. baseline is retained for comparison tooling."
+        ),
+    )
+    parser.add_argument(
+        "--fp16-report",
+        type=str,
+        default=None,
+        help="Optional JSON report path for explicit-fp16-dataflow.",
+    )
+    parser.add_argument(
+        "--fp16-calibration-data",
+        type=str,
+        default=None,
+        help=(
+            "NPZ calibration inputs for explicit-fp16-dataflow. When omitted, real validation "
+            "samples are collected through the configured val dataloader."
+        ),
+    )
+    parser.add_argument(
+        "--fp16-calibration-samples",
+        type=int,
+        default=1,
+        help="Number of real validation samples to collect for dataflow FP16 calibration.",
+    )
+    parser.add_argument(
+        "--fp16-data-max",
+        type=float,
+        default=DEFAULT_DATA_MAX,
+        help="Maximum calibrated activation magnitude eligible for FP16 conversion.",
+    )
+    parser.add_argument(
+        "--fp16-init-max",
+        type=float,
+        default=DEFAULT_INIT_MAX,
+        help="Maximum initializer magnitude eligible for FP16 conversion.",
+    )
+    parser.add_argument(
         "--input-size",
         nargs="+",
         type=int,
@@ -1571,6 +1780,11 @@ def parse_args():
         help="Export ONNX without dynamic batch axes; min/opt/max batch values must be equal.",
     )
     parser.add_argument("--skip-onnx", action="store_true", help="Use existing ONNX if present.")
+    parser.add_argument(
+        "--onnx-only",
+        action="store_true",
+        help="Export and validate ONNX without requiring CUDA or building TensorRT engines.",
+    )
     parser.add_argument(
         "--skip-build",
         action="store_true",

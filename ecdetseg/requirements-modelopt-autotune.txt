@@ -1,0 +1,1 @@
+nvidia-modelopt[onnx]==0.46.0

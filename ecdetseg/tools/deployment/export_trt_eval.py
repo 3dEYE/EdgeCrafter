@@ -1034,11 +1034,30 @@ def _validate_engine_contract(
             f"TensorRT runner requires exactly one optimization profile, got {engine_contract['profile_count']}"
         )
 
-    for key in ("inputs", "outputs", "input_shapes"):
+    for key in ("inputs", "outputs"):
         if engine_contract[key] != onnx_contract[key]:
             raise ValueError(
                 f"TensorRT {key} contract mismatch: got {engine_contract[key]}, "
                 f"expected {onnx_contract[key]}"
+            )
+
+    engine_input_shapes = engine_contract["input_shapes"]
+    onnx_input_shapes = onnx_contract["input_shapes"]
+    if engine_input_shapes.keys() != onnx_input_shapes.keys():
+        raise ValueError(
+            f"TensorRT input shape names mismatch: got {engine_input_shapes.keys()}, "
+            f"expected {onnx_input_shapes.keys()}"
+        )
+    for name, onnx_shape in onnx_input_shapes.items():
+        engine_shape = engine_input_shapes[name]
+        compatible = len(engine_shape) == len(onnx_shape) and all(
+            expected < 0 or actual == expected
+            for actual, expected in zip(engine_shape, onnx_shape)
+        )
+        if not compatible:
+            raise ValueError(
+                f"TensorRT input shape mismatch for {name}: got {engine_shape}, "
+                f"expected ONNX-compatible {onnx_shape}"
             )
 
     engine_output_shapes = engine_contract["output_shapes"]
@@ -1074,9 +1093,31 @@ def _validate_engine_contract(
                 (opt_batch, 2),
                 (max_batch, 2),
             )
-    if engine_contract["profiles"] != expected_profiles:
+    actual_profiles = engine_contract["profiles"]
+    profiles_match = actual_profiles == expected_profiles
+    if (
+        not profiles_match
+        and not static_batch
+        and not actual_profiles
+        and min_batch == opt_batch == max_batch
+    ):
+        # TensorRT may materialize a dynamic ONNX input as a fixed engine tensor
+        # when all optimization-profile bounds are equal. In that case the
+        # serialized input no longer contains -1 and the reader cannot discover
+        # the profile from the tensor shape. Accept it only when every fixed
+        # engine input exactly matches the requested degenerate profile.
+        collapsed_profile_shapes = {
+            name: profile[0]
+            for name, profile in expected_profiles.items()
+            if profile[0] == profile[1] == profile[2]
+        }
+        profiles_match = (
+            len(collapsed_profile_shapes) == len(expected_profiles)
+            and engine_input_shapes == collapsed_profile_shapes
+        )
+    if not profiles_match:
         raise ValueError(
-            f"TensorRT optimization profile mismatch: got {engine_contract['profiles']}, "
+            f"TensorRT optimization profile mismatch: got {actual_profiles}, "
             f"expected {expected_profiles}"
         )
 

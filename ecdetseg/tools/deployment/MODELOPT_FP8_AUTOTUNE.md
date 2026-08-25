@@ -48,6 +48,7 @@ checkpoint path, ModelOpt version, and Autotune settings.
   --checkpoint C:\path\to\weights.pth `
   --input-size 512 512 `
   --calibration-samples 128 `
+  --calibration-batch-size 1 `
   --autotune-mode quick `
   --gpu auto-fp8 `
   --evaluate `
@@ -85,6 +86,11 @@ target-specific:
 `auto-fp8` verifies declared FP8 support; it does not assume that FP8 is faster. If several
 eligible GPUs are visible, pass the desired CUDA index or limit `CUDA_VISIBLE_DEVICES`.
 ModelOpt Autotune then makes the performance decision against FP16 on that card.
+
+`--calibration-samples` controls coverage, while `--calibration-batch-size` controls peak
+host memory during the preliminary FP16 AutoCast pass. The default batch size is 1: all
+samples still contribute to the collected ranges, but intermediate ONNX Runtime outputs are
+aggregated and released after every batch instead of being retained for the whole corpus.
 
 TensorRT engines are target builds too; do not ship an engine built for another GPU profile.
 NVIDIA's [engine compatibility documentation](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/engine-compatibility.html)

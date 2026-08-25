@@ -1,11 +1,14 @@
 """Build a calibrated, dataflow-aware explicit FP16 ONNX graph."""
 
-from collections import Counter
+from collections import Counter, OrderedDict
+import copy
 from hashlib import sha256
+from importlib import import_module
 from importlib import metadata
 import json
 from pathlib import Path
 import tempfile
+import threading
 from typing import Callable, Dict, Optional, Sequence
 
 import numpy as np
@@ -29,6 +32,36 @@ DEFAULT_FP32_NODE_PATTERNS = (
 # protected separately by DEFAULT_FP32_NODE_PATTERNS and full COCO parity.
 DEFAULT_DATA_MAX = 65504.0
 DEFAULT_INIT_MAX = 65504.0
+
+_MODELOPT_REFERENCE_RUNNER_LOCK = threading.Lock()
+
+
+class _CalibrationBatchStream(dict):
+    """Keep one calibration corpus while exposing bounded inference batches."""
+
+    def __init__(self, values: Dict[str, np.ndarray], batch_size: int) -> None:
+        super().__init__(values)
+        self.batch_size = int(batch_size)
+        self.sample_count = int(next(iter(values.values())).shape[0])
+        if self.batch_size <= 0:
+            raise ValueError("Calibration batch size must be positive.")
+        if self.sample_count % self.batch_size != 0:
+            raise ValueError(
+                "Calibration sample count must be divisible by calibration batch size: "
+                f"samples={self.sample_count}, batch_size={self.batch_size}."
+            )
+
+    @property
+    def batch_count(self) -> int:
+        return self.sample_count // self.batch_size
+
+    def iter_batches(self):
+        for start in range(0, self.sample_count, self.batch_size):
+            stop = start + self.batch_size
+            yield OrderedDict(
+                (name, np.ascontiguousarray(value[start:stop]))
+                for name, value in self.items()
+            )
 
 
 def _sha256_file(path: Path) -> str:
@@ -215,10 +248,118 @@ def _load_calibration(calibration_path: Path, input_names: Sequence[str]) -> Dic
     return calibration
 
 
-def _default_converter(**kwargs):
-    from modelopt.onnx.autocast import convert_to_mixed_precision
+def _update_streaming_stats(aggregated, values, tensor_stats_type) -> None:
+    for name, value in values.items():
+        array = np.asarray(value)
+        if not (
+            np.issubdtype(array.dtype, np.number)
+            or np.issubdtype(array.dtype, np.bool_)
+        ):
+            continue
+        if array.size:
+            with np.errstate(over="ignore", invalid="ignore"):
+                batch_absmax = float(np.max(np.abs(array)))
+                batch_min = float(np.min(array))
+                batch_max = float(np.max(array))
+        else:
+            batch_absmax = batch_min = batch_max = 0.0
 
-    return convert_to_mixed_precision(**kwargs)
+        current = aggregated.get(name)
+        if current is None:
+            aggregated[name] = tensor_stats_type(
+                absmax=batch_absmax,
+                min_val=batch_min,
+                max_val=batch_max,
+                shape=tuple(array.shape),
+            )
+        else:
+            current.absmax = max(current.absmax, batch_absmax)
+            current.min_val = min(current.min_val, batch_min)
+            current.max_val = max(current.max_val, batch_max)
+
+
+def _run_modelopt_reference_streaming(reference_runner, calibration: _CalibrationBatchStream):
+    """Run ModelOpt's all-output ORT model without retaining every batch output."""
+    import onnxruntime as ort
+    from modelopt.onnx import utils as onnx_utils
+    from modelopt.onnx.autocast.referencerunner import TensorStats
+    from polygraphy import constants
+    from polygraphy.backend.onnx import ModifyOutputs as ModifyOnnxOutputs
+
+    ort.set_default_logger_severity(3)
+    model_copy = copy.deepcopy(reference_runner.model)
+    onnx_utils.clear_stale_value_info(model_copy)
+    modified_model = ModifyOnnxOutputs(model_copy, outputs=constants.MARK_ALL)
+    runners = reference_runner._get_ort_runner(modified_model)
+    if len(runners) != 1:
+        raise RuntimeError(
+            f"ModelOpt streaming calibration expected one ORT runner, got {len(runners)}."
+        )
+
+    print(
+        "ModelOpt AutoCast streaming calibration: "
+        f"{calibration.sample_count} samples, {calibration.batch_count} batches, "
+        f"batch_size={calibration.batch_size}."
+    )
+    aggregated = OrderedDict()
+    single_batch_data = None
+    runner = runners[0]
+    runner.activate()
+    try:
+        for batch_index, feed_dict in enumerate(calibration.iter_batches()):
+            if batch_index == 0:
+                reference_runner._validate_inputs([feed_dict])
+            outputs = runner.infer(feed_dict, check_inputs=batch_index == 0)
+            combined = OrderedDict(feed_dict)
+            combined.update(outputs)
+            _update_streaming_stats(aggregated, combined, TensorStats)
+            if calibration.batch_count == 1:
+                single_batch_data = combined
+            else:
+                del combined
+                del outputs
+    finally:
+        runner.deactivate()
+
+    if single_batch_data is not None:
+        return single_batch_data
+    return aggregated
+
+
+def _default_converter(**kwargs):
+    calibration_data = kwargs.get("calibration_data")
+    if not isinstance(calibration_data, _CalibrationBatchStream):
+        from modelopt.onnx.autocast import convert_to_mixed_precision
+
+        return convert_to_mixed_precision(**kwargs)
+
+    # ModelOpt 0.46 supports multiple calibration batches, but its reference
+    # runner first retains every marked intermediate output and only aggregates
+    # ranges after all batches finish. For detector graphs that is effectively
+    # O(samples * all_intermediate_tensors) RAM. Replace only the converter's
+    # private runner class for this call and aggregate each batch immediately.
+    convert_module = import_module("modelopt.onnx.autocast.convert")
+    reference_runner_type = convert_module.ReferenceRunner
+    required_methods = ("_get_ort_runner", "_validate_inputs")
+    missing = [name for name in required_methods if not hasattr(reference_runner_type, name)]
+    if missing:
+        raise RuntimeError(
+            "Installed ModelOpt ReferenceRunner is incompatible with bounded-memory "
+            f"calibration; missing methods: {missing}."
+        )
+
+    class StreamingReferenceRunner(reference_runner_type):
+        def run(self, inputs=None):
+            if isinstance(inputs, _CalibrationBatchStream):
+                return _run_modelopt_reference_streaming(self, inputs)
+            return super().run(inputs)
+
+    with _MODELOPT_REFERENCE_RUNNER_LOCK:
+        convert_module.ReferenceRunner = StreamingReferenceRunner
+        try:
+            return convert_module.convert_to_mixed_precision(**kwargs)
+        finally:
+            convert_module.ReferenceRunner = reference_runner_type
 
 
 def apply_dataflow_fp16_precision(
@@ -227,6 +368,7 @@ def apply_dataflow_fp16_precision(
     report_path: Optional[Path] = None,
     data_max: float = DEFAULT_DATA_MAX,
     init_max: float = DEFAULT_INIT_MAX,
+    calibration_batch_size: int = 1,
     fp32_node_patterns: Sequence[str] = DEFAULT_FP32_NODE_PATTERNS,
     converter: Optional[Callable[..., object]] = None,
 ) -> Dict[str, object]:
@@ -242,11 +384,11 @@ def apply_dataflow_fp16_precision(
     source_model = onnx.load(str(model_path), load_external_data=False)
     input_names = [value.name for value in source_model.graph.input]
     calibration = _load_calibration(calibration_path, input_names)
-    batch_size = next(iter(calibration.values())).shape[0]
+    calibration_stream = _CalibrationBatchStream(calibration, calibration_batch_size)
 
     static_model = onnx.ModelProto()
     static_model.CopyFrom(source_model)
-    _set_static_batch(static_model, int(batch_size))
+    _set_static_batch(static_model, calibration_stream.batch_size)
 
     converter = converter or _default_converter
     with tempfile.TemporaryDirectory(prefix="edgecrafter_fp16_", dir=str(model_path.parent)) as temp_dir:
@@ -259,7 +401,7 @@ def apply_dataflow_fp16_precision(
             data_max=float(data_max),
             init_max=float(init_max),
             keep_io_types=True,
-            calibration_data={name: value for name, value in calibration.items()},
+            calibration_data=calibration_stream,
             providers=["cpu"],
             opset=int(source_model.opset_import[0].version),
         )
@@ -302,7 +444,10 @@ def apply_dataflow_fp16_precision(
         "calibration": {
             "path": str(calibration_path.resolve()),
             "sha256": _sha256_file(calibration_path),
-            "batch_size": int(batch_size),
+            "sample_count": calibration_stream.sample_count,
+            "batch_size": calibration_stream.batch_size,
+            "batch_count": calibration_stream.batch_count,
+            "streaming": converter is _default_converter,
             "inputs": activation_stats,
         },
         "thresholds": {"data_max": float(data_max), "init_max": float(init_max)},

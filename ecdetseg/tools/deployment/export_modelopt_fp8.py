@@ -752,6 +752,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             source_onnx,
             calibration_path=calibration_path,
             report_path=fp16_report_path,
+            calibration_batch_size=args.calibration_batch_size,
             fp32_node_patterns=DEFAULT_FP32_NODE_PATTERNS,
         )
         fp16_seconds = time.perf_counter() - fp16_started

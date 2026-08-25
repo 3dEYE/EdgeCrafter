@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import sys
 import tempfile
@@ -89,6 +90,8 @@ class DataflowFp16OnnxTest(unittest.TestCase):
             )
 
             self.assertEqual(report["calibration"]["batch_size"], 1)
+            self.assertEqual(report["calibration"]["sample_count"], 1)
+            self.assertEqual(report["calibration"]["batch_count"], 1)
             self.assertEqual(report["calibration"]["inputs"]["images"]["max_abs"], 4.0)
             self.assertEqual(report["source_float_weights"]["nonzero_below_fp16_subnormal_count"], 1)
             persisted = json.loads(report_path.read_text(encoding="utf-8"))
@@ -109,6 +112,81 @@ class DataflowFp16OnnxTest(unittest.TestCase):
                     calibration_path,
                     converter=lambda **_: _make_dynamic_model(),
                 )
+
+    def test_uses_bounded_batches_without_dropping_calibration_samples(self):
+        captured = {}
+
+        def fake_converter(**kwargs):
+            captured.update(kwargs)
+            converted = onnx.load(kwargs["onnx_path"], load_external_data=False)
+            self.assertEqual(converted.graph.input[0].type.tensor_type.shape.dim[0].dim_value, 2)
+            return converted
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "model.onnx"
+            calibration_path = root / "calibration.npz"
+            onnx.save(_make_dynamic_model(), model_path)
+            calibration = np.arange(24, dtype=np.float16).reshape(6, 4)
+            np.savez(calibration_path, images=calibration)
+
+            report = apply_dataflow_fp16_precision(
+                model_path,
+                calibration_path,
+                calibration_batch_size=2,
+                converter=fake_converter,
+            )
+
+            calibration_stream = captured["calibration_data"]
+            batches = list(calibration_stream.iter_batches())
+            self.assertEqual([batch["images"].shape for batch in batches], [(2, 4)] * 3)
+            np.testing.assert_array_equal(
+                np.concatenate([batch["images"] for batch in batches], axis=0),
+                calibration,
+            )
+            self.assertEqual(report["calibration"]["sample_count"], 6)
+            self.assertEqual(report["calibration"]["batch_size"], 2)
+            self.assertEqual(report["calibration"]["batch_count"], 3)
+
+    def test_rejects_non_divisible_calibration_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "model.onnx"
+            calibration_path = root / "calibration.npz"
+            onnx.save(_make_dynamic_model(), model_path)
+            np.savez(calibration_path, images=np.ones((3, 4), np.float16))
+
+            with self.assertRaisesRegex(ValueError, "must be divisible"):
+                apply_dataflow_fp16_precision(
+                    model_path,
+                    calibration_path,
+                    calibration_batch_size=2,
+                    converter=lambda **_: _make_dynamic_model(),
+                )
+
+    @unittest.skipUnless(importlib.util.find_spec("modelopt"), "nvidia-modelopt is not installed")
+    def test_real_modelopt_converter_streams_multiple_batches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "model.onnx"
+            calibration_path = root / "calibration.npz"
+            onnx.save(_make_dynamic_model(), model_path)
+            np.savez(
+                calibration_path,
+                images=np.arange(16, dtype=np.float16).reshape(4, 4),
+            )
+
+            report = apply_dataflow_fp16_precision(
+                model_path,
+                calibration_path,
+                calibration_batch_size=1,
+            )
+
+            checker.check_model(onnx.load(model_path, load_external_data=False))
+            self.assertTrue(report["calibration"]["streaming"])
+            self.assertEqual(report["calibration"]["sample_count"], 4)
+            self.assertEqual(report["calibration"]["batch_size"], 1)
+            self.assertEqual(report["calibration"]["batch_count"], 4)
 
 
 if __name__ == "__main__":

@@ -442,6 +442,7 @@ def export_onnx(
     fp16_report: Optional[Path] = None,
     fp16_calibration_data: Optional[Path] = None,
     fp16_calibration_samples: int = 1,
+    fp16_calibration_batch_size: int = 1,
     fp16_data_max: float = DEFAULT_DATA_MAX,
     fp16_init_max: float = DEFAULT_INIT_MAX,
 ) -> Path:
@@ -568,6 +569,7 @@ def export_onnx(
             output_file,
             calibration_path=calibration_path,
             report_path=fp16_report,
+            calibration_batch_size=fp16_calibration_batch_size,
             data_max=fp16_data_max,
             init_max=fp16_init_max,
         )
@@ -1523,6 +1525,17 @@ def main(args) -> None:
         raise ValueError(
             "--fp16-calibration-data requires --onnx-precision-policy explicit-fp16-dataflow."
         )
+    if args.fp16_calibration_batch_size <= 0:
+        raise ValueError("--fp16-calibration-batch-size must be positive.")
+    if (
+        args.onnx_precision_policy == "explicit-fp16-dataflow"
+        and args.fp16_calibration_data is None
+        and args.fp16_calibration_samples % args.fp16_calibration_batch_size != 0
+    ):
+        raise ValueError(
+            "--fp16-calibration-samples must be divisible by "
+            "--fp16-calibration-batch-size."
+        )
 
     cfg = _build_eval_cfg(args)
     img_h, img_w = cfg.yaml_cfg["eval_spatial_size"]
@@ -1550,6 +1563,7 @@ def main(args) -> None:
                 Path(args.fp16_calibration_data) if args.fp16_calibration_data else None
             ),
             fp16_calibration_samples=args.fp16_calibration_samples,
+            fp16_calibration_batch_size=args.fp16_calibration_batch_size,
             fp16_data_max=args.fp16_data_max,
             fp16_init_max=args.fp16_init_max,
         )
@@ -1740,6 +1754,15 @@ def parse_args():
         type=int,
         default=1,
         help="Number of real validation samples to collect for dataflow FP16 calibration.",
+    )
+    parser.add_argument(
+        "--fp16-calibration-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Maximum samples evaluated together by ModelOpt/ONNX Runtime during dataflow "
+            "FP16 calibration. Keep this small to bound host RAM (default: 1)."
+        ),
     )
     parser.add_argument(
         "--fp16-data-max",

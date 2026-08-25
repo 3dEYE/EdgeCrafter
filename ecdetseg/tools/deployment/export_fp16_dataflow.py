@@ -79,6 +79,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-size", nargs="+", type=int, default=None)
     parser.add_argument("--opset", type=int, default=20)
     parser.add_argument("--calibration-samples", type=int, default=1)
+    parser.add_argument(
+        "--calibration-batch-size",
+        type=int,
+        default=1,
+        help="Maximum ModelOpt/ORT calibration batch held in host RAM (default: 1).",
+    )
     parser.add_argument("--fp16-data-max", type=float, default=DEFAULT_DATA_MAX)
     parser.add_argument("--fp16-init-max", type=float, default=DEFAULT_INIT_MAX)
     parser.add_argument("--min-batch", type=int, default=1)
@@ -206,8 +212,10 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
     assert dataset_root is not None and data_file is not None and val_path is not None and data_cfg is not None
     if not val_path.exists():
         raise FileNotFoundError(f"Validation image path does not exist: {val_path}")
-    if args.calibration_samples <= 0:
-        raise ValueError("--calibration-samples must be positive.")
+    if args.calibration_samples <= 0 or args.calibration_batch_size <= 0:
+        raise ValueError("Calibration samples and batch size must be positive.")
+    if args.calibration_samples % args.calibration_batch_size != 0:
+        raise ValueError("--calibration-samples must be divisible by --calibration-batch-size.")
     if args.fp16_data_max <= 0.0 or args.fp16_init_max <= 0.0:
         raise ValueError("FP16 data and initializer limits must be positive.")
     if args.evaluate and args.onnx_only:
@@ -236,6 +244,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
         "image_hw": list(image_hw),
         "num_top_queries": num_top_queries,
         "calibration_samples": args.calibration_samples,
+        "calibration_batch_size": args.calibration_batch_size,
         "profile_batches": [args.min_batch, args.opt_batch, args.max_batch],
         "build_tensorrt": not args.onnx_only,
         "evaluate": args.evaluate,
@@ -289,6 +298,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             onnx_precision_policy="explicit-fp16-dataflow",
             fp16_report=precision_report_path,
             fp16_calibration_samples=args.calibration_samples,
+            fp16_calibration_batch_size=args.calibration_batch_size,
             fp16_data_max=args.fp16_data_max,
             fp16_init_max=args.fp16_init_max,
         )

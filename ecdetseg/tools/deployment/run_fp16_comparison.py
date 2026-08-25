@@ -105,6 +105,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--score-threshold", type=float, default=0.0)
     parser.add_argument("--eval-limit", type=int, default=None, help="Debug only: limit validation images.")
     parser.add_argument("--calibration-samples", type=int, default=1)
+    parser.add_argument(
+        "--calibration-batch-size",
+        type=int,
+        default=1,
+        help="Maximum ModelOpt/ORT calibration batch held in host RAM (default: 1).",
+    )
     parser.add_argument("--fp16-data-max", type=float, default=DEFAULT_DATA_MAX)
     parser.add_argument("--fp16-init-max", type=float, default=DEFAULT_INIT_MAX)
     parser.add_argument("--benchmark-warmup", type=int, default=10)
@@ -388,6 +394,7 @@ def _export_variant(
         onnx_precision_policy=policy,
         fp16_report=report_path,
         fp16_calibration_samples=args.calibration_samples,
+        fp16_calibration_batch_size=args.calibration_batch_size,
         fp16_data_max=args.fp16_data_max,
         fp16_init_max=args.fp16_init_max,
     )
@@ -428,6 +435,10 @@ def run(args: argparse.Namespace) -> Tuple[Path, bool]:
     assert dataset_root is not None and data_file is not None and val_path is not None and data_cfg is not None
     if not val_path.exists():
         raise FileNotFoundError(f"Validation image path does not exist: {val_path}")
+    if args.calibration_samples <= 0 or args.calibration_batch_size <= 0:
+        raise ValueError("Calibration samples and batch size must be positive.")
+    if args.calibration_samples % args.calibration_batch_size != 0:
+        raise ValueError("--calibration-samples must be divisible by --calibration-batch-size.")
 
     input_size_override = _parse_input_size(args.input_size)
     benchmark_batch = args.benchmark_batch_size or args.opt_batch
@@ -650,6 +661,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, bool]:
                 "workspace_gb": args.workspace_gb,
                 "opset": args.opset,
                 "calibration_samples": args.calibration_samples,
+                "calibration_batch_size": args.calibration_batch_size,
                 "fp16_data_max": args.fp16_data_max,
                 "fp16_init_max": args.fp16_init_max,
             },

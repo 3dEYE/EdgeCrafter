@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.deployment.onnx_dataflow_fp16 import (  # noqa: E402
     DATAFLOW_FP16_POLICY,
     DEFAULT_FP32_NODE_PATTERNS,
+    _require_cuda_execution_provider,
     apply_dataflow_fp16_precision,
+    modelopt_gpu_first_providers,
 )
 from tools.deployment.onnx_precision import read_precision_policy  # noqa: E402
 
@@ -47,7 +50,28 @@ def _make_dynamic_model():
     return model
 
 
+def _modelopt_cuda_available():
+    if importlib.util.find_spec("modelopt") is None or importlib.util.find_spec("onnxruntime") is None:
+        return False
+    import onnxruntime as ort
+
+    return "CUDAExecutionProvider" in ort.get_available_providers()
+
+
 class DataflowFp16OnnxTest(unittest.TestCase):
+    def test_modelopt_providers_are_gpu_first_with_cpu_fallback(self):
+        self.assertEqual(modelopt_gpu_first_providers(2), ["cuda:2", "cpu"])
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            modelopt_gpu_first_providers(-1)
+
+    def test_gpu_first_rejects_silent_cpu_only_fallback(self):
+        with mock.patch("onnxruntime.get_available_providers", return_value=["CPUExecutionProvider"]):
+            with self.assertRaisesRegex(RuntimeError, "requires CUDAExecutionProvider"):
+                _require_cuda_execution_provider(["cuda:0", "cpu"])
+
+        with mock.patch("onnxruntime.get_available_providers", return_value=["CPUExecutionProvider"]):
+            _require_cuda_execution_provider(["cpu"])
+
     def test_restores_dynamic_contract_and_records_real_calibration(self):
         captured = {}
 
@@ -84,12 +108,14 @@ class DataflowFp16OnnxTest(unittest.TestCase):
             self.assertEqual(len(rewritten.graph.value_info), 0)
             self.assertEqual(read_precision_policy(model_path), DATAFLOW_FP16_POLICY)
             self.assertEqual(captured["nodes_to_exclude"], list(DEFAULT_FP32_NODE_PATTERNS))
+            self.assertEqual(captured["providers"], ["cuda:0", "cpu"])
             np.testing.assert_array_equal(
                 captured["calibration_data"]["images"],
                 np.array([[1.0, -2.0, 3.0, 4.0]], np.float16),
             )
 
             self.assertEqual(report["calibration"]["batch_size"], 1)
+            self.assertEqual(report["calibration"]["requested_providers"], ["cuda:0", "cpu"])
             self.assertEqual(report["calibration"]["sample_count"], 1)
             self.assertEqual(report["calibration"]["batch_count"], 1)
             self.assertEqual(report["calibration"]["inputs"]["images"]["max_abs"], 4.0)
@@ -164,7 +190,10 @@ class DataflowFp16OnnxTest(unittest.TestCase):
                     converter=lambda **_: _make_dynamic_model(),
                 )
 
-    @unittest.skipUnless(importlib.util.find_spec("modelopt"), "nvidia-modelopt is not installed")
+    @unittest.skipUnless(
+        _modelopt_cuda_available(),
+        "nvidia-modelopt with ONNX Runtime CUDAExecutionProvider is not installed",
+    )
     def test_real_modelopt_converter_streams_multiple_batches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

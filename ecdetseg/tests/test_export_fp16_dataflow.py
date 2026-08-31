@@ -24,6 +24,7 @@ class ExportFp16DataflowTests(unittest.TestCase):
         )
         self.assertEqual(args.calibration_samples, 1)
         self.assertEqual(args.calibration_batch_size, 1)
+        self.assertEqual(args.gpu, 0)
         self.assertFalse(args.onnx_only)
         self.assertFalse(hasattr(args, "onnx_precision_policy"))
         self.assertEqual(DATAFLOW_FP16_POLICY, "explicit_fp16_dataflow_calibrated_v1")

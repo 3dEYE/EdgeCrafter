@@ -91,7 +91,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--opt-batch", type=int, default=4)
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument("--workspace-gb", type=float, default=8.0)
-    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="Visible CUDA device used first by ModelOpt/ORT calibration and by TensorRT.",
+    )
     parser.add_argument("--onnx-only", action="store_true")
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--eval-batch-size", type=int, default=8)
@@ -299,6 +304,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             fp16_report=precision_report_path,
             fp16_calibration_samples=args.calibration_samples,
             fp16_calibration_batch_size=args.calibration_batch_size,
+            fp16_calibration_gpu=args.gpu,
             fp16_data_max=args.fp16_data_max,
             fp16_init_max=args.fp16_init_max,
         )

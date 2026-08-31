@@ -26,6 +26,7 @@ from tools.deployment.onnx_dataflow_fp16 import (
     DEFAULT_DATA_MAX,
     DEFAULT_INIT_MAX,
     apply_dataflow_fp16_precision,
+    modelopt_gpu_first_providers,
 )
 from tools.deployment.onnx_precision import read_precision_policy
 
@@ -443,6 +444,7 @@ def export_onnx(
     fp16_calibration_data: Optional[Path] = None,
     fp16_calibration_samples: int = 1,
     fp16_calibration_batch_size: int = 1,
+    fp16_calibration_gpu: int = 0,
     fp16_data_max: float = DEFAULT_DATA_MAX,
     fp16_init_max: float = DEFAULT_INIT_MAX,
 ) -> Path:
@@ -572,6 +574,7 @@ def export_onnx(
             calibration_batch_size=fp16_calibration_batch_size,
             data_max=fp16_data_max,
             init_max=fp16_init_max,
+            providers=modelopt_gpu_first_providers(fp16_calibration_gpu),
         )
         converted_initializers = report["converted_initializers"]["count"]
         print(
@@ -1532,7 +1535,7 @@ def _validate_engine_manifest(engine_path: Path, onnx_path: Path, precision: str
     return manifest_path
 
 
-def _select_cuda_device(gpu: Optional[int]) -> None:
+def _select_cuda_device(gpu: Optional[int]) -> int:
     if gpu is None:
         current = torch.cuda.current_device()
     else:
@@ -1546,6 +1549,7 @@ def _select_cuda_device(gpu: Optional[int]) -> None:
 
     name = torch.cuda.get_device_name(current)
     print(f"Using CUDA device {current}: {name}")
+    return current
 
 
 def main(args) -> None:
@@ -1558,8 +1562,11 @@ def main(args) -> None:
         args.max_batch,
         args.eval_batch_size,
     )
+    calibration_gpu = args.gpu if args.gpu is not None else 0
     if not args.onnx_only:
-        _select_cuda_device(args.gpu)
+        calibration_gpu = _select_cuda_device(args.gpu)
+    elif args.onnx_precision_policy == "explicit-fp16-dataflow" and torch.cuda.is_available():
+        calibration_gpu = _select_cuda_device(args.gpu)
     if args.fp16_report and args.onnx_precision_policy != "explicit-fp16-dataflow":
         raise ValueError("--fp16-report requires --onnx-precision-policy explicit-fp16-dataflow.")
     if args.fp16_calibration_data and args.onnx_precision_policy != "explicit-fp16-dataflow":
@@ -1605,6 +1612,7 @@ def main(args) -> None:
             ),
             fp16_calibration_samples=args.fp16_calibration_samples,
             fp16_calibration_batch_size=args.fp16_calibration_batch_size,
+            fp16_calibration_gpu=calibration_gpu,
             fp16_data_max=args.fp16_data_max,
             fp16_init_max=args.fp16_init_max,
         )
@@ -1829,7 +1837,15 @@ def parse_args():
     parser.add_argument("--max-batch", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None, help="Evaluate only the first N validation images.")
-    parser.add_argument("--gpu", type=int, default=None, help="Visible CUDA device index, e.g. --gpu 1.")
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help=(
+            "Visible CUDA device index for TensorRT and GPU-first ModelOpt/ORT calibration, "
+            "e.g. --gpu 1."
+        ),
+    )
     parser.add_argument("--num-top-queries", type=int, default=None, help="Override PostProcessor.num_top_queries.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Filter predictions before COCO eval.")
     parser.add_argument(

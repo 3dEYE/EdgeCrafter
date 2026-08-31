@@ -42,6 +42,7 @@ from tools.deployment.onnx_dataflow_fp16 import (
     DATAFLOW_FP16_POLICY,
     DEFAULT_FP32_NODE_PATTERNS,
     apply_dataflow_fp16_precision,
+    modelopt_gpu_first_providers,
 )
 from tools.deployment.onnx_modelopt_qdq import (
     MODEL_OPT_FP8_SUPPORTED_OP_TYPES,
@@ -754,6 +755,7 @@ def run(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             report_path=fp16_report_path,
             calibration_batch_size=args.calibration_batch_size,
             fp32_node_patterns=DEFAULT_FP32_NODE_PATTERNS,
+            providers=modelopt_gpu_first_providers(selected_gpu),
         )
         fp16_seconds = time.perf_counter() - fp16_started
 

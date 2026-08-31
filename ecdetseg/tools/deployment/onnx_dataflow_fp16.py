@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -34,6 +34,29 @@ DEFAULT_DATA_MAX = 65504.0
 DEFAULT_INIT_MAX = 65504.0
 
 _MODELOPT_REFERENCE_RUNNER_LOCK = threading.Lock()
+
+
+def modelopt_gpu_first_providers(gpu: int) -> List[str]:
+    """Return ModelOpt's ORT provider priority for one visible CUDA device."""
+    if gpu < 0:
+        raise ValueError(f"ModelOpt calibration GPU index must be non-negative, got {gpu}.")
+    return [f"cuda:{gpu}", "cpu"]
+
+
+def _require_cuda_execution_provider(providers: Sequence[str]) -> None:
+    cuda_requested = any(provider == "cuda" or provider.startswith("cuda:") for provider in providers)
+    if not cuda_requested:
+        return
+
+    import onnxruntime as ort
+
+    available = list(ort.get_available_providers())
+    if "CUDAExecutionProvider" not in available:
+        raise RuntimeError(
+            "GPU-first ModelOpt calibration requires CUDAExecutionProvider, but this Python "
+            f"environment exposes only {available}. Install a compatible onnxruntime-gpu "
+            "package in the same environment."
+        )
 
 
 class _CalibrationBatchStream(dict):
@@ -370,6 +393,7 @@ def apply_dataflow_fp16_precision(
     init_max: float = DEFAULT_INIT_MAX,
     calibration_batch_size: int = 1,
     fp32_node_patterns: Sequence[str] = DEFAULT_FP32_NODE_PATTERNS,
+    providers: Optional[Sequence[str]] = None,
     converter: Optional[Callable[..., object]] = None,
 ) -> Dict[str, object]:
     """Convert a model using real activation ranges and explicit FP32 islands."""
@@ -379,6 +403,11 @@ def apply_dataflow_fp16_precision(
     calibration_path = Path(calibration_path)
     if data_max <= 0.0 or init_max <= 0.0:
         raise ValueError("data_max and init_max must be positive.")
+    if isinstance(providers, str):
+        raise TypeError("ModelOpt providers must be a sequence of provider names, not one string.")
+    requested_providers = list(providers) if providers is not None else modelopt_gpu_first_providers(0)
+    if not requested_providers:
+        raise ValueError("At least one ModelOpt ONNX Runtime provider is required.")
 
     source_sha256 = _sha256_file(model_path)
     source_model = onnx.load(str(model_path), load_external_data=False)
@@ -390,7 +419,10 @@ def apply_dataflow_fp16_precision(
     static_model.CopyFrom(source_model)
     _set_static_batch(static_model, calibration_stream.batch_size)
 
+    if converter is None:
+        _require_cuda_execution_provider(requested_providers)
     converter = converter or _default_converter
+    print(f"ModelOpt AutoCast ORT provider priority: {requested_providers}")
     with tempfile.TemporaryDirectory(prefix="edgecrafter_fp16_", dir=str(model_path.parent)) as temp_dir:
         static_path = Path(temp_dir) / "calibration_static.onnx"
         onnx.save(static_model, str(static_path), save_as_external_data=False)
@@ -402,7 +434,7 @@ def apply_dataflow_fp16_precision(
             init_max=float(init_max),
             keep_io_types=True,
             calibration_data=calibration_stream,
-            providers=["cpu"],
+            providers=requested_providers,
             opset=int(source_model.opset_import[0].version),
         )
 
@@ -444,6 +476,7 @@ def apply_dataflow_fp16_precision(
         "calibration": {
             "path": str(calibration_path.resolve()),
             "sha256": _sha256_file(calibration_path),
+            "requested_providers": requested_providers,
             "sample_count": calibration_stream.sample_count,
             "batch_size": calibration_stream.batch_size,
             "batch_count": calibration_stream.batch_count,

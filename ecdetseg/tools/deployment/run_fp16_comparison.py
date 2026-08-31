@@ -395,6 +395,7 @@ def _export_variant(
         fp16_report=report_path,
         fp16_calibration_samples=args.calibration_samples,
         fp16_calibration_batch_size=args.calibration_batch_size,
+        fp16_calibration_gpu=args.gpu,
         fp16_data_max=args.fp16_data_max,
         fp16_init_max=args.fp16_init_max,
     )
